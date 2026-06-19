@@ -11,8 +11,23 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Extract zip
-      run: unzip -o binscurez.zip -d ./
+    - name: Debug - List all files
+      run: |
+        echo "=== All files in repo ==="
+        ls -la
+        echo ""
+        echo "=== Find zip files ==="
+        find . -name "*.zip" -type f
+    
+    - name: Find and extract zip
+      run: |
+        ZIP=$(find . -name "*.zip" -type f | head -1)
+        if [ -z "$ZIP" ]; then
+          echo "ERROR: No zip file found!"
+          exit 1
+        fi
+        echo "Extracting: $ZIP"
+        unzip -o "$ZIP" -d ./
     
     - name: Commit extracted files
       run: |
