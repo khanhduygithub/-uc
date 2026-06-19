@@ -1,9 +1,52 @@
-- name: Create ALL_CODE.txt
-  run: |
-    echo "=== ALL SOURCE CODE ===" > ALL_CODE.txt
+name: Show Native Code
+
+on: [workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  show-code:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
     
-    find duckdz/ -type f \( -name "*.kt" -o -name "*.java" -o -name "*.mm" -o -name "*.h" -o -name "*.m" -o -name "*.cpp" -o -name "*.c" -o -name "*.xml" -o -name "*.gradle" \) | sort | while read f; do
-      echo "" >> ALL_CODE.txt
-      echo "=== $f ===" >> ALL_CODE.txt
-      cat "$f" >> ALL_CODE.txt 2>/dev/null || echo "[Binary]" >> ALL_CODE.txt
-    done
+    - name: Find and extract zip
+      run: |
+        ZIP=$(find . -name "*.zip" -type f | head -1)
+        if [ -z "$ZIP" ]; then
+          echo "ERROR: No zip file found!"
+          exit 1
+        fi
+        unzip -o "$ZIP" -d duckdz/
+    
+    - name: Create all native code file
+      run: |
+        echo "=== ALL NATIVE CODE ===" > ALL_NATIVE.txt
+        
+        find duckdz/ -type f \( -name "*.mm" -o -name "*.h" -o -name "*.m" -o -name "*.cpp" -o -name "*.c" \) | sort | while read f; do
+          echo "" >> ALL_NATIVE.txt
+          echo "========================================" >> ALL_NATIVE.txt
+          echo "=== $f ===" >> ALL_NATIVE.txt
+          echo "========================================" >> ALL_NATIVE.txt
+          cat "$f" >> ALL_NATIVE.txt 2>/dev/null || echo "[Read error]" >> ALL_NATIVE.txt
+        done
+        
+        echo "" >> ALL_NATIVE.txt
+        echo "=== KOTLIN/JAVA CODE ===" >> ALL_NATIVE.txt
+        
+        find duckdz/ -type f \( -name "*.kt" -o -name "*.java" \) | sort | while read f; do
+          echo "" >> ALL_NATIVE.txt
+          echo "========================================" >> ALL_NATIVE.txt
+          echo "=== $f ===" >> ALL_NATIVE.txt
+          echo "========================================" >> ALL_NATIVE.txt
+          cat "$f" >> ALL_NATIVE.txt 2>/dev/null || echo "[Read error]" >> ALL_NATIVE.txt
+        done
+    
+    - name: Commit
+      run: |
+        git config user.name "github-actions"
+        git config user.email "actions@github.com"
+        git add ALL_NATIVE.txt
+        git commit -m "Add ALL_NATIVE.txt" || echo "No changes"
+        git push
