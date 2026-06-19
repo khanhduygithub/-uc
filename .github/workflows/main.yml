@@ -1,4 +1,4 @@
-name: Show Native Code
+name: Split into 4 Parts
 
 on: [workflow_dispatch]
 
@@ -6,47 +6,35 @@ permissions:
   contents: write
 
 jobs:
-  show-code:
+  split:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     
-    - name: Find and extract zip
+    - name: Extract zip
       run: |
-        ZIP=$(find . -name "*.zip" -type f | head -1)
-        if [ -z "$ZIP" ]; then
-          echo "ERROR: No zip file found!"
-          exit 1
-        fi
-        unzip -o "$ZIP" -d duckdz/
+        find . -name "*.zip" -exec unzip -o {} -d duckdz/ \;
     
-    - name: Create all native code file
+    - name: Create ALL_CODE.txt
       run: |
-        echo "=== ALL NATIVE CODE ===" > ALL_NATIVE.txt
-        
-        find duckdz/ -type f \( -name "*.mm" -o -name "*.h" -o -name "*.m" -o -name "*.cpp" -o -name "*.c" \) | sort | while read f; do
-          echo "" >> ALL_NATIVE.txt
-          echo "========================================" >> ALL_NATIVE.txt
-          echo "=== $f ===" >> ALL_NATIVE.txt
-          echo "========================================" >> ALL_NATIVE.txt
-          cat "$f" >> ALL_NATIVE.txt 2>/dev/null || echo "[Read error]" >> ALL_NATIVE.txt
-        done
-        
-        echo "" >> ALL_NATIVE.txt
-        echo "=== KOTLIN/JAVA CODE ===" >> ALL_NATIVE.txt
-        
-        find duckdz/ -type f \( -name "*.kt" -o -name "*.java" \) | sort | while read f; do
-          echo "" >> ALL_NATIVE.txt
-          echo "========================================" >> ALL_NATIVE.txt
-          echo "=== $f ===" >> ALL_NATIVE.txt
-          echo "========================================" >> ALL_NATIVE.txt
-          cat "$f" >> ALL_NATIVE.txt 2>/dev/null || echo "[Read error]" >> ALL_NATIVE.txt
+        echo "=== ALL CODE ===" > ALL_CODE.txt
+        find duckdz/ -type f \( -name "*.mm" -o -name "*.h" -o -name "*.m" -o -name "*.cpp" -o -name "*.c" -o -name "*.kt" -o -name "*.java" \) | sort | while read f; do
+          echo "" >> ALL_CODE.txt
+          echo "=== $f ===" >> ALL_CODE.txt
+          cat "$f" >> ALL_CODE.txt
         done
     
-    - name: Commit
+    - name: Split into 4 parts
+      run: |
+        mkdir -p parts
+        split -d -C 10M ALL_CODE.txt parts/part_
+        echo "Parts created:"
+        ls -lh parts/
+    
+    - name: Commit parts
       run: |
         git config user.name "github-actions"
         git config user.email "actions@github.com"
-        git add ALL_NATIVE.txt
-        git commit -m "Add ALL_NATIVE.txt" || echo "No changes"
+        git add parts/
+        git commit -m "Add code parts" || echo "No changes"
         git push
