@@ -1,4 +1,4 @@
-name: Extract and Show on GitHub
+name: Create All Code File for Gist
 
 on: [workflow_dispatch]
 
@@ -6,18 +6,10 @@ permissions:
   contents: write
 
 jobs:
-  extract:
+  create-all-code:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Debug - List all files
-      run: |
-        echo "=== All files in repo ==="
-        ls -la
-        echo ""
-        echo "=== Find zip files ==="
-        find . -name "*.zip" -type f
     
     - name: Find and extract zip
       run: |
@@ -27,12 +19,34 @@ jobs:
           exit 1
         fi
         echo "Extracting: $ZIP"
-        unzip -o "$ZIP" -d ./
+        unzip -o "$ZIP" -d duckdz/
     
-    - name: Commit extracted files
+    - name: Create ALL_CODE.txt
+      run: |
+        echo "=== ALL SOURCE CODE ===" > ALL_CODE.txt
+        echo "" >> ALL_CODE.txt
+        
+        find duckdz/ -type f \( -name "*.kt" -o -name "*.java" -o -name "*.xml" -o -name "*.gradle" \) | sort | while read f; do
+          echo "" >> ALL_CODE.txt
+          echo "========================================" >> ALL_CODE.txt
+          echo "=== FILE: $f ===" >> ALL_CODE.txt
+          echo "========================================" >> ALL_CODE.txt
+          echo "" >> ALL_CODE.txt
+          cat "$f" >> ALL_CODE.txt
+          echo "" >> ALL_CODE.txt
+        done
+        
+        echo "Total lines: $(wc -l < ALL_CODE.txt)"
+    
+    - name: Commit ALL_CODE.txt
       run: |
         git config user.name "github-actions"
         git config user.email "actions@github.com"
-        git add .
-        git commit -m "Extracted files" || echo "No changes"
+        git add ALL_CODE.txt
+        git commit -m "Add ALL_CODE.txt for Gist" || echo "No changes"
         git push
+    
+    - name: Show file size
+      run: |
+        echo "File size: $(du -h ALL_CODE.txt | cut -f1)"
+        echo "Lines: $(wc -l < ALL_CODE.txt)"
