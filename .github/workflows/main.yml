@@ -28,10 +28,10 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Set up Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: '15.2'
+    - name: Show Xcode version
+      run: |
+        xcodebuild -version
+        echo "SDK Path: $(xcrun --sdk macosx --show-sdk-path)"
     
     - name: Build obf.o
       run: |
@@ -54,12 +54,6 @@ jobs:
           -fobjc-arc \
           -isysroot $(xcrun --sdk macosx --show-sdk-path) \
           -mmacosx-version-min=10.15
-    
-    - name: Create universal binary (optional)
-      if: matrix.arch == 'arm64'
-      run: |
-        # Combine if needed (requires previous x86_64 build)
-        echo "Universal binary creation would go here"
     
     - name: Upload object files
       uses: actions/upload-artifact@v4
@@ -106,6 +100,7 @@ jobs:
         
         echo "Created universal object files:"
         ls -la universal/
+        echo "Architecture info:"
         lipo -info universal/*.o
     
     - name: Upload universal binaries
@@ -126,13 +121,26 @@ jobs:
     - name: Verify object files
       run: |
         echo "=== Architecture-specific builds ==="
-        for file in object-files-x86_64/*.o; do
-          echo "File: $file"
-          lipo -info "$file" || file "$file"
-        done
+        echo "x86_64 builds:"
+        if [ -d "object-files-x86_64" ]; then
+          for file in object-files-x86_64/*.o; do
+            echo "  File: $file"
+            file "$file" | grep -o 'x86_64\|arm64\|Mach-O'
+          done
+        fi
+        
+        echo -e "\narm64 builds:"
+        if [ -d "object-files-arm64" ]; then
+          for file in object-files-arm64/*.o; do
+            echo "  File: $file"
+            file "$file" | grep -o 'x86_64\|arm64\|Mach-O'
+          done
+        fi
         
         echo -e "\n=== Universal binaries ==="
-        for file in universal-object-files/*.o; do
-          echo "File: $file"
-          lipo -info "$file" || file "$file"
-        done
+        if [ -d "universal-object-files" ]; then
+          for file in universal-object-files/*.o; do
+            echo "  File: $file"
+            lipo -info "$file" 2>/dev/null || file "$file"
+          done
+        fi
