@@ -1,46 +1,138 @@
-name: Build object files
+name: Build Objective-C++ Object Files
 
 on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'obf.h'
+      - 'obf.mm'
+      - 'DuyKeyAuth.mm'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'obf.h'
+      - 'obf.mm'
+      - 'DuyKeyAuth.mm'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
     
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+    
     steps:
-    - name: Checkout repo
+    - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Download private source files
+    
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.2'
+    
+    - name: Build obf.o
       run: |
-        curl -L "${{ secrets.DUYKEYAUTH_MM_URL }}" -o DuyKeyAuth.mm
-        curl -L "${{ secrets.OBF_MM_URL }}" -o obf.mm
-        curl -L "${{ secrets.OBF_H_URL }}" -o obf.h
-
-    - name: Compile to object files
+        clang++ -c obf.mm \
+          -o obf_${{ matrix.arch }}.o \
+          -arch ${{ matrix.arch }} \
+          -std=c++17 \
+          -O2 \
+          -fobjc-arc \
+          -isysroot $(xcrun --sdk macosx --show-sdk-path) \
+          -mmacosx-version-min=10.15
+    
+    - name: Build DuyKeyAuth.o
       run: |
         clang++ -c DuyKeyAuth.mm \
-          -o DuyKeyAuth.o \
-          -arch arm64 \
-          -arch x86_64 \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-          -mios-version-min=12.0 \
+          -o DuyKeyAuth_${{ matrix.arch }}.o \
+          -arch ${{ matrix.arch }} \
+          -std=c++17 \
+          -O2 \
           -fobjc-arc \
-          -O2
-        
-        clang++ -c obf.mm \
-          -o obf.o \
-          -arch arm64 \
-          -arch x86_64 \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-          -mios-version-min=12.0 \
-          -fobjc-arc \
-          -O2
-
+          -isysroot $(xcrun --sdk macosx --show-sdk-path) \
+          -mmacosx-version-min=10.15
+    
+    - name: Create universal binary (optional)
+      if: matrix.arch == 'arm64'
+      run: |
+        # Combine if needed (requires previous x86_64 build)
+        echo "Universal binary creation would go here"
+    
     - name: Upload object files
       uses: actions/upload-artifact@v4
       with:
-        name: object-files
+        name: object-files-${{ matrix.arch }}
         path: |
-          DuyKeyAuth.o
-          obf.o
+          obf_${{ matrix.arch }}.o
+          DuyKeyAuth_${{ matrix.arch }}.o
+        retention-days: 30
+
+  create-universal:
+    needs: build
+    runs-on: macos-latest
+    if: success()
+    
+    steps:
+    - name: Download x86_64 objects
+      uses: actions/download-artifact@v4
+      with:
+        name: object-files-x86_64
+        path: x86_64
+    
+    - name: Download arm64 objects
+      uses: actions/download-artifact@v4
+      with:
+        name: object-files-arm64
+        path: arm64
+    
+    - name: Create universal binaries
+      run: |
+        mkdir -p universal
+        
+        # Create universal obf.o
+        lipo -create \
+          x86_64/obf_x86_64.o \
+          arm64/obf_arm64.o \
+          -output universal/obf.o
+        
+        # Create universal DuyKeyAuth.o
+        lipo -create \
+          x86_64/DuyKeyAuth_x86_64.o \
+          arm64/DuyKeyAuth_arm64.o \
+          -output universal/DuyKeyAuth.o
+        
+        echo "Created universal object files:"
+        ls -la universal/
+        lipo -info universal/*.o
+    
+    - name: Upload universal binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: universal-object-files
+        path: universal/*.o
+        retention-days: 30
+
+  verify:
+    needs: [build, create-universal]
+    runs-on: macos-latest
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+    
+    - name: Verify object files
+      run: |
+        echo "=== Architecture-specific builds ==="
+        for file in object-files-x86_64/*.o; do
+          echo "File: $file"
+          lipo -info "$file" || file "$file"
+        done
+        
+        echo -e "\n=== Universal binaries ==="
+        for file in universal-object-files/*.o; do
+          echo "File: $file"
+          lipo -info "$file" || file "$file"
+        done
