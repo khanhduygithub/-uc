@@ -1,40 +1,58 @@
-name: Split into 4 Parts
+name: Build libDuyKeyAuth.a
 
-on: [workflow_dispatch]
-
-permissions:
-  contents: write
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  split:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: macos-latest
+    
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Extract zip
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+
+    - name: Compile object files
       run: |
-        find . -name "*.zip" -exec unzip -o {} -d duckdz/ \;
-    
-    - name: Create ALL_CODE.txt
+        # Compile DuyKeyAuth.mm to object file
+        clang++ -c DuyKeyAuth.mm \
+          -o DuyKeyAuth.o \
+          -arch arm64 \
+          -arch x86_64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -mios-version-min=12.0 \
+          -fobjc-arc \
+          -O2
+        
+        # Compile obf.mm to object file
+        clang++ -c obf.mm \
+          -o obf.o \
+          -arch arm64 \
+          -arch x86_64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -mios-version-min=12.0 \
+          -fobjc-arc \
+          -O2
+
+    - name: Create static library
       run: |
-        echo "=== ALL CODE ===" > ALL_CODE.txt
-        find duckdz/ -type f \( -name "*.mm" -o -name "*.h" -o -name "*.m" -o -name "*.cpp" -o -name "*.c" -o -name "*.kt" -o -name "*.java" \) | sort | while read f; do
-          echo "" >> ALL_CODE.txt
-          echo "=== $f ===" >> ALL_CODE.txt
-          cat "$f" >> ALL_CODE.txt
-        done
-    
-    - name: Split into 4 parts
-      run: |
-        mkdir -p parts
-        split -d -C 10M ALL_CODE.txt parts/part_
-        echo "Parts created:"
-        ls -lh parts/
-    
-    - name: Commit parts
-      run: |
-        git config user.name "github-actions"
-        git config user.email "actions@github.com"
-        git add parts/
-        git commit -m "Add code parts" || echo "No changes"
-        git push
+        # Create fat static library
+        libtool -static -o libDuyKeyAuth.a DuyKeyAuth.o obf.o
+        
+        # Verify the library
+        lipo -info libDuyKeyAuth.a
+        nm libDuyKeyAuth.a | grep -E "T|U" | head -20
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libDuyKeyAuth
+        path: libDuyKeyAuth.a
