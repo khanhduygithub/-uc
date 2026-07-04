@@ -1,19 +1,14 @@
-name: Build DuyKeyAuth.o
+name: Build object files
 
 on:
   workflow_dispatch:
-    inputs:
-      api_token:
-        description: 'Your API Token'
-        required: true
-        type: string
 
 jobs:
   build:
     runs-on: macos-latest
     
     steps:
-    - name: Checkout public repo
+    - name: Checkout repo
       uses: actions/checkout@v4
 
     - name: Download private source files
@@ -22,20 +17,8 @@ jobs:
         curl -L "${{ secrets.OBF_MM_URL }}" -o obf.mm
         curl -L "${{ secrets.OBF_H_URL }}" -o obf.h
 
-    - name: Generate HeaderAPI.h with token
-      run: |
-        cat > HeaderAPI.h << EOF
-        #ifndef HeaderAPI_h
-        #define HeaderAPI_h
-        
-        #define API_TOKEN @"${{ github.event.inputs.api_token }}"
-        
-        #endif /* HeaderAPI_h */
-        EOF
-
     - name: Compile to object files
       run: |
-        # Compile DuyKeyAuth.mm to object file
         clang++ -c DuyKeyAuth.mm \
           -o DuyKeyAuth.o \
           -arch arm64 \
@@ -45,7 +28,6 @@ jobs:
           -fobjc-arc \
           -O2
         
-        # Compile obf.mm to object file
         clang++ -c obf.mm \
           -o obf.o \
           -arch arm64 \
@@ -54,14 +36,11 @@ jobs:
           -mios-version-min=12.0 \
           -fobjc-arc \
           -O2
-        
-        echo "Build complete!"
-        ls -la *.o
 
-    - name: Upload artifacts
+    - name: Upload object files
       uses: actions/upload-artifact@v4
       with:
-        name: DuyKeyAuth-object-files
+        name: object-files
         path: |
           DuyKeyAuth.o
           obf.o
