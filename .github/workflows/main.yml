@@ -1,21 +1,39 @@
-name: Build libDuyKeyAuth.a
+name: Build DuyKeyAuth.o
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      api_token:
+        description: 'Your API Token'
+        required: true
+        type: string
 
 jobs:
   build:
     runs-on: macos-latest
     
     steps:
-    - name: Checkout code
+    - name: Checkout public repo
       uses: actions/checkout@v4
 
-    - name: Compile object files
+    - name: Download private source files
+      run: |
+        curl -L "${{ secrets.DUYKEYAUTH_MM_URL }}" -o DuyKeyAuth.mm
+        curl -L "${{ secrets.OBF_MM_URL }}" -o obf.mm
+        curl -L "${{ secrets.OBF_H_URL }}" -o obf.h
+
+    - name: Generate HeaderAPI.h with token
+      run: |
+        cat > HeaderAPI.h << EOF
+        #ifndef HeaderAPI_h
+        #define HeaderAPI_h
+        
+        #define API_TOKEN @"${{ github.event.inputs.api_token }}"
+        
+        #endif /* HeaderAPI_h */
+        EOF
+
+    - name: Compile to object files
       run: |
         # Compile DuyKeyAuth.mm to object file
         clang++ -c DuyKeyAuth.mm \
@@ -36,18 +54,14 @@ jobs:
           -mios-version-min=12.0 \
           -fobjc-arc \
           -O2
-
-    - name: Create static library
-      run: |
-        # Create fat static library
-        libtool -static -o libDuyKeyAuth.a DuyKeyAuth.o obf.o
         
-        # Verify the library
-        lipo -info libDuyKeyAuth.a
-        nm libDuyKeyAuth.a | grep -E "T|U" | head -20
+        echo "Build complete!"
+        ls -la *.o
 
-    - name: Upload artifact
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: libDuyKeyAuth
-        path: libDuyKeyAuth.a
+        name: DuyKeyAuth-object-files
+        path: |
+          DuyKeyAuth.o
+          obf.o
