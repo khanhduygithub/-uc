@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import UIKit
 
 /// ESP Free Fire engine — DarkSword remake of the CrackTeam TrollStore HUD.
 ///
@@ -339,29 +340,45 @@ final class ESPEngine: ObservableObject {
 
     // MARK: - Launch game
 
-    /// Launch Free Fire through SpringBoard. Runs alongside a pending
-    /// auto-start on purpose — the waiting ESP pipeline picks the game up as
-    /// soon as it appears (never touches `busy`, which belongs to the
-    /// start/stop pipeline).
+    /// Candidate URL schemes registered by Free Fire builds (global/VN/JP).
+    /// canOpenURL requires LSApplicationQueriesSchemes in Info.plist — both
+    /// lists must stay in sync.
+    private static let gameURLSchemes = [
+        "freefire", "garenafreefire", "freefireth", "gff", "garena",
+    ]
+
+    /// Launch Free Fire through the PUBLIC URL-scheme path only.
+    /// Task 15: the previous implementation acquired the SpringBoard
+    /// RemoteCall session just to send SBSLaunchApplicationWithIdentifier —
+    /// a full EXC_GUARD thread hijack of SpringBoard for something iOS can
+    /// do without any kernel involvement, and exactly the path that
+    /// kernel-panicked the device when SpringBoard still carried hijack
+    /// debris. UIApplication.open is public API: it never touches the
+    /// kernel, fails gracefully when no scheme matches, and the waiting
+    /// ESP auto-start pipeline picks the game up the moment it appears.
+    /// (Runs on the MainActor — ESPEngine is @MainActor — so
+    /// UIApplication.shared is safe to touch.)
     func launchGame() {
         if busy && !autoStartPending { return }
-        queue.async { [weak self] in
-            guard let self else { return }
-            var message: String
-            if let sessionFailure = DarkswordMechanism.acquireSessionForESP() {
-                message = sessionFailure
-            } else {
-                defer { DarkswordMechanism.releaseSessionForESP() }
-                let rc = esp_host_launch_game()
-                message = rc == 0
-                    ? "đã gửi lệnh mở Free Fire qua SpringBoard"
-                    : "mở game thất bại (\(rc)) — SpringBoard không có đường dẫn phù hợp"
+        for scheme in Self.gameURLSchemes {
+            guard let url = URL(string: "\(scheme)://") else { continue }
+            guard UIApplication.shared.canOpenURL(url) else { continue }
+            log("esp: mở Free Fire qua scheme \(scheme):// (public API — không đụng kernel/SpringBoard)…")
+            lastMessage = "đang mở Free Fire qua \(scheme):// — ESP tự ghim khi game xuất hiện"
+            UIApplication.shared.open(url, options: [:]) { ok in
+                DispatchQueue.main.async {
+                    let message = ok
+                        ? "đã gửi lệnh mở Free Fire qua \(scheme)://"
+                        : "mở Free Fire qua \(scheme):// bị từ chối — hãy mở game thủ công từ màn hình chính"
+                    log("esp: \(message)")
+                    if !ok { self.lastMessage = message }
+                }
             }
-            DispatchQueue.main.async {
-                self.lastMessage = message
-                log("esp: \(message)")
-            }
+            return
         }
+        let message = "không tìm thấy URL scheme của Free Fire — hãy mở game thủ công từ màn hình chính (ESP vẫn tự ghim khi game xuất hiện)"
+        lastMessage = message
+        log("esp: \(message)")
     }
 
     // MARK: - Settings sync (ESPPrefs keys = CrackTeam runtime keys)

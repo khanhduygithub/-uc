@@ -48,6 +48,10 @@ typedef enum {
     RemoteCallInitFailureNoTargetThreads,
     RemoteCallInitFailureFirstExceptionTimeout,
     RemoteCallInitFailureOther,
+    // Task 15: the target already survived one failed hijack this app run;
+    // re-hijacking the same live pid is the kernel-panic path, so further
+    // attempts are refused until the process respawns (new pid).
+    RemoteCallInitFailureTargetPoisoned,
 } RemoteCallInitFailure;
 
 mach_port_t create_exception_port(void);

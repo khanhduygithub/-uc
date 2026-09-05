@@ -102,6 +102,19 @@ bool restore_trojan_thread(arm_thread_state64_internal *state);
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
 
+// --- Task 15: hijack poison gate -------------------------------------------
+// A failed EXC_GUARD hijack leaves debris on the target even after the
+// best-effort trojan restore: the second injected thread keeps an exception
+// port whose receive right we are about to drop, the task keeps the relaxed
+// exc_guard behavior, and the trojan may keep faulting for a while.
+// Re-hijacking the SAME live process on top of that debris is the
+// kernel-panic path (observed on device: the second "Mở Free Fire" press
+// panicked while the first only failed gracefully). One failed attempt per
+// target pid therefore poisons it until the process respawns (new pid) or
+// the app restarts. Cleared again by every successful init.
+static uint32_t g_RC_poisonedPid = 0;
+static bool g_RC_pidPoisoned = false;
+
 typedef struct RemoteCallState {
     uint64_t taskAddr;
     bool creatingExtraThread;
@@ -219,6 +232,7 @@ const char *remote_call_init_failure_description(RemoteCallInitFailure failure)
         case RemoteCallInitFailureNoTargetThreads: return "no injectable target threads";
         case RemoteCallInitFailureFirstExceptionTimeout: return "target did not deliver bootstrap exception";
         case RemoteCallInitFailureOther: return "other RemoteCall init failure";
+        case RemoteCallInitFailureTargetPoisoned: return "target carries hijack debris from an earlier failed attempt — respring (or reboot) required before retrying";
     }
     return "unknown RemoteCall init failure";
 }
@@ -855,6 +869,16 @@ static bool wait_verified_exception(mach_port_t port, ExceptionMessage *exc,
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    // Task 15: an exception we cannot attribute to the expected thread must
+    // NEVER be hijacked with trojan-signed state — the PAC diversifier and
+    // keys belong to the trojan thread, so a foreign thread executing that
+    // state rogue-faults inside the target and accumulates SpringBoard
+    // damage (respring/panic seed). Reply such strangers with their OWN
+    // state and keep waiting for the real trojan, bounded so a pathological
+    // exception stream cannot spin forever.
+    int strayCount = 0;
+    const int maxStrays = 8;
+
     for (;;) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -872,9 +896,13 @@ static bool wait_verified_exception(mach_port_t port, ExceptionMessage *exc,
 
         uint64_t raisedBy = exception_thread_kaddr(exc);
         if (!raisedBy) {
-            printf("[RemoteCall] %s: exception sender unknown (id=%u size=%u) — accepting (fail-open)\n",
-                   what ?: "wait", exc->msgId, exc->msgSize);
-            return true;
+            strayCount++;
+            printf("[RemoteCall] %s: exception sender unknown (id=%u size=%u) — replying original state, keep waiting (%d/%d)\n",
+                   what ?: "wait", exc->msgId, exc->msgSize, strayCount, maxStrays);
+            if (strayCount >= maxStrays)
+                return false;
+            reply_with_state(exc, &exc->threadState);
+            continue;
         }
         if (raisedBy == expectedThread)
             return true;
@@ -897,6 +925,50 @@ static void restore_trojan_before_abandon(void)
         return;
     printf("[RemoteCall] restoring hijacked thread state before abandon…\n");
     restore_trojan_thread(&g_RC_originalState);
+}
+
+// --- Task 15: post-mortem exception drain -----------------------------------
+// Even after a clean restore, target threads keep SEND rights to our
+// exception ports, and a half-restored trojan can keep faulting for a
+// while. Destroying the receive right immediately turns every late fault
+// into an undeliverable exception inside the target — the documented
+// "SpringBoard damage → respring cascade" seed. Hand the port to a
+// detached drain thread instead: it replies every late exception with the
+// SENDER'S OWN state (stray threads resume untouched, never trojan-signed
+// state) and destroys the port once the window closes.
+#define RC_DRAIN_SECONDS 30
+
+static void *exception_drain_main(void *arg)
+{
+    mach_port_t port = (mach_port_t)(uintptr_t)arg;
+    time_t deadline = time(NULL) + RC_DRAIN_SECONDS;
+    for (;;) {
+        ExceptionMessage exc;
+        if (wait_exception(port, &exc, 1000, false)) {
+            reply_with_state(&exc, &exc.threadState);
+        }
+        // Bounded lifetime regardless of traffic: check the deadline even
+        // when exceptions keep arriving.
+        if (time(NULL) >= deadline)
+            break;
+    }
+    destroy_exception_port(port);
+    return NULL;
+}
+
+static void start_exception_drain(mach_port_t port)
+{
+    if (!MACH_PORT_VALID(port))
+        return;
+    pthread_t drainThread;
+    if (pthread_create(&drainThread, NULL, exception_drain_main, (void *)(uintptr_t)port) == 0) {
+        pthread_detach(drainThread);
+        printf("[RemoteCall] exception drain armed for %ds (port 0x%x)\n",
+               RC_DRAIN_SECONDS, port);
+    } else {
+        // No thread available — fall back to the old immediate destroy.
+        destroy_exception_port(port);
+    }
 }
 
 uint64_t do_remote_call_temp_internal(int timeout, const char *name,
@@ -950,19 +1022,18 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
     if(strcmp(name, "getpid") == 0 && retValue == 0) {
-        static bool getpidDiagDumped = false;
-        if (!getpidDiagDumped) {
-            getpidDiagDumped = true;
-            uint64_t raisedBy = exception_thread_kaddr(&exc2);
-            // Disambiguates the three known failure shapes of the bootstrap
-            // call: senderThread != trojanThread → stray-thread interleave;
-            // pc == callPc → getpid never executed (PAC/PC reply rejected);
-            // pc == fakeLr → getpid ran but x0 was not the return value.
-            printf("[RemoteCall] getpid bootstrap diagnostics: ret=0 pc=%#llx lr=%#llx sp=%#llx callPc=%#llx fakeLr=%#llx senderThread=%#llx trojanThread=%#llx msgId=%u msgSize=%u\n",
-                   exc2.threadState.__pc, exc2.threadState.__lr, exc2.threadState.__sp,
-                   pcAddr, (uint64_t)FAKE_LR_TROJAN_CREATOR, raisedBy, g_RC_trojanThreadAddr,
-                   exc2.msgId, exc2.msgSize);
-        }
+        uint64_t raisedBy = exception_thread_kaddr(&exc2);
+        // Disambiguates the three known failure shapes of the bootstrap
+        // call: senderThread != trojanThread → stray-thread interleave;
+        // pc == callPc → getpid never executed (PAC/PC reply rejected);
+        // pc == fakeLr → getpid ran but x0 was not the return value;
+        // senderThread == 0 → unidentifiable sender.
+        // Task 15: dumped on EVERY failure (was once-per-process, which hid
+        // later attempts from the device log).
+        printf("[RemoteCall] getpid bootstrap diagnostics: ret=0 pc=%#llx lr=%#llx sp=%#llx callPc=%#llx fakeLr=%#llx senderThread=%#llx trojanThread=%#llx msgId=%u msgSize=%u\n",
+               exc2.threadState.__pc, exc2.threadState.__lr, exc2.threadState.__sp,
+               pcAddr, (uint64_t)FAKE_LR_TROJAN_CREATOR, raisedBy, g_RC_trojanThreadAddr,
+               exc2.msgId, exc2.msgSize);
         printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
     }
@@ -1113,8 +1184,11 @@ void abandon_remote_call_internal(void) {
     // Skip every SB-side IPC. Caller has decided that the remote task is dead
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
-    destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    // Task 15: drain instead of immediate destroy — late faults from target
+    // threads holding our send rights must get a safe original-state reply,
+    // not an undeliverable exception.
+    start_exception_drain(g_RC_firstExceptionPort);
+    start_exception_drain(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1180,8 +1254,11 @@ int destroy_remote_call_internal(void) {
         restore_trojan_thread(&g_RC_originalState);
     }
 
-    destroy_exception_port(g_RC_firstExceptionPort);
-    destroy_exception_port(g_RC_secondExceptionPort);
+    // Task 15: drain instead of immediate destroy — the trojan was restored
+    // above but may still fault once (it resumes on the reply), and the
+    // second injected thread keeps a send right to our port.
+    start_exception_drain(g_RC_firstExceptionPort);
+    start_exception_drain(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
     if (MACH_PORT_VALID(g_RC_dummyThreadMach)) {
         mach_port_deallocate(mach_task_self_, g_RC_dummyThreadMach);
@@ -1464,6 +1541,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                                                   0, 0, 0, 0, 0, 0, 0, 0);
             if (g_RC_pid <= 0) g_RC_pid = 1;
             printf("[VPHONE-BRIDGE] using SpringBoard bridge pid=%d\n", g_RC_pid);
+            g_RC_pidPoisoned = false;
             return 0;
         }
         printf("[VPHONE-BRIDGE] SpringBoard bridge unavailable; falling back to KRW RemoteCall\n");
@@ -1492,7 +1570,17 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         return -1;
     }
     uint32_t targetPid = kread32(procAddr + off_proc_p_pid);
+    if (g_RC_pidPoisoned && targetPid == g_RC_poisonedPid) {
+        printf("[RemoteCall] refusing %s hijack: an earlier attempt already failed on pid %u — the process still carries hijack debris; respring (or reboot) required before retrying\n",
+               process, targetPid);
+        remote_call_note_init_failure(RemoteCallInitFailureTargetPoisoned, targetPid);
+        return -1;
+    }
     printf("[RemoteCall] Found %s in kernel (pid=%u) — preparing EXC_GUARD thread hijack.\n", process, targetPid);
+    // Assume this attempt damages the target until proven otherwise; every
+    // success return below clears the flag again.
+    g_RC_poisonedPid = targetPid;
+    g_RC_pidPoisoned = true;
     RC_DEBUG("[%s:%d] process: %s, pid: %u\n", __FUNCTION__, __LINE__, process, targetPid);
     g_RC_taskAddr = proc_task(procAddr);
     if (!g_RC_taskAddr || !is_kaddr_valid(g_RC_taskAddr)) {
@@ -1818,6 +1906,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         g_RC_vmMap = task_get_vm_map(g_RC_taskAddr);
         g_RC_pid = (int)targetPid;
         g_RC_success = true;
+        g_RC_pidPoisoned = false;
         RC_DEBUG("[%s:%d] Original-thread-only RemoteCall ready; skipping synthetic pthread\n",
              __FUNCTION__, __LINE__);
         return 0;
@@ -1923,6 +2012,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     do_remote_call_stable(100, "memset", g_RC_trojanMem, 0, PAGE_SIZE, 0, 0, 0, 0, 0);
 
     g_RC_success = true;
+    g_RC_pidPoisoned = false;
     RC_DEBUG("[%s:%d] Finished successfully\n", __FUNCTION__, __LINE__);
 
     return 0;
