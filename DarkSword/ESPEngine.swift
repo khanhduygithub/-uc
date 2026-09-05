@@ -153,11 +153,23 @@ final class ESPEngine: ObservableObject {
                 return
             }
 
-            // 2. overlay + registration through the shared SpringBoard session
-            if let sessionFailure = DarkswordMechanism.acquireSessionForESP() {
+            // 2. overlay + registration through the shared SpringBoard session.
+            // Bounded retry: a transient bootstrap failure (e.g. a thread that
+            // needed a beat after the hijack dance) must not kill the whole
+            // one-button chain — but never loop forever against the kernel.
+            var sessionFailure = DarkswordMechanism.acquireSessionForESP()
+            if sessionFailure != nil {
+                for attempt in 2...3 {
+                    log("esp: \(sessionFailure!) — thử mở lại session sau 2 s (lần \(attempt)/3)…")
+                    Thread.sleep(forTimeInterval: 2.0)
+                    sessionFailure = DarkswordMechanism.acquireSessionForESP()
+                    if sessionFailure == nil { break }
+                }
+            }
+            if let failure = sessionFailure {
                 self.autoStartPending = false
                 Task { @MainActor [weak self] in
-                    self?.finishStart(ok: false, message: sessionFailure)
+                    self?.finishStart(ok: false, message: failure)
                 }
                 return
             }

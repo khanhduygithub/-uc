@@ -20,6 +20,14 @@ typedef struct {
     uint32_t                old_stateCnt;
     arm_thread_state64_internal    threadState;
     uint64_t                padding[2];
+    // Parsed by wait_exception from the kernel-processed descriptor area that
+    // the kernel sends right after the header on every exception_raise*
+    // message (thread first, task second). Zero when parsing could not be
+    // done confidently — callers must fail open in that case.
+    mach_port_t             threadPort;   // send right to the trapped thread
+    mach_port_t             taskPort;     // send right to the trapped task
+    uint32_t                msgId;        // Head.msgh_id (2401..2407 family)
+    uint32_t                msgSize;      // Head.msgh_size
 } ExceptionMessage;
 
 typedef struct {
@@ -34,4 +42,4 @@ typedef struct {
 mach_port_t create_exception_port(void);
 void destroy_exception_port(mach_port_t exceptionPort);
 bool wait_exception(mach_port_t exceptionPort, ExceptionMessage *excBuffer, int timeout, bool debug);
-void reply_with_state(ExceptionMessage *exc, arm_thread_state64_internal *state);
+bool reply_with_state(ExceptionMessage *exc, arm_thread_state64_internal *state);

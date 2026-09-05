@@ -42,6 +42,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t addre
 #import "../kexploit/kutils.h"
 #import "../kexploit/xpaci.h"
 #import "../utils/process.h"
+#import <time.h>
 
 extern bool gIsPACSupported;
 
@@ -96,6 +97,7 @@ bool remote_read_internal(uint64_t src, void *dst, uint64_t size);
 bool remote_write_internal(uint64_t dst, const void *src, uint64_t size);
 int destroy_remote_call_internal(void);
 void abandon_remote_call_internal(void);
+bool restore_trojan_thread(arm_thread_state64_internal *state);
 
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
@@ -114,6 +116,7 @@ typedef struct RemoteCallState {
     uint64_t selfThreadAddr;
     uint32_t selfThreadCtid;
     arm_thread_state64_internal originalState;
+    bool haveOriginalState;
     uint64_t vmMap;
     uint64_t callThreadAddr;
     uint64_t trojanThreadAddr;
@@ -170,6 +173,7 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_selfThreadAddr        (remote_call_current_state()->selfThreadAddr)
 #define g_RC_selfThreadCtid        (remote_call_current_state()->selfThreadCtid)
 #define g_RC_originalState         (remote_call_current_state()->originalState)
+#define g_RC_haveOriginalState     (remote_call_current_state()->haveOriginalState)
 #define g_RC_vmMap                 (remote_call_current_state()->vmMap)
 #define g_RC_callThreadAddr        (remote_call_current_state()->callThreadAddr)
 #define g_RC_trojanThreadAddr      (remote_call_current_state()->trojanThreadAddr)
@@ -809,6 +813,92 @@ uint64_t do_remote_call_temp(int timeout, const char *name,
     return res;
 }
 
+// Resolves the kernel address of the thread that raised an exception message.
+// Returns 0 when the sender cannot be identified (descriptor parse failed or
+// the port did not resolve) — callers must fail open in that case.
+static uint64_t exception_thread_kaddr(const ExceptionMessage *exc)
+{
+    if (!exc || !MACH_PORT_VALID(exc->threadPort))
+        return 0;
+    uint64_t kaddr = task_get_ipc_port_kobject(task_self(), exc->threadPort);
+    if (!kaddr || !is_kaddr_valid(kaddr))
+        return 0;
+    return kaddr;
+}
+
+static bool exception_thread_is_injected(uint64_t threadKAddr)
+{
+    if (!threadKAddr)
+        return false;
+    for (NSNumber *thread in g_RC_threadList) {
+        if ((uint64_t)thread.unsignedLongLongValue == threadKAddr)
+            return true;
+    }
+    return false;
+}
+
+// wait_exception plus source-thread verification: only accepts exceptions
+// raised by expectedThread (0 = accept any). Anything else — e.g. the second
+// injected thread's guard firing late after the drain window, or a target
+// thread taking a real fault while we hold its exception port — is replied
+// with its ORIGINAL state so the target resumes untouched, and the wait keeps
+// running until the deadline. When the sender cannot be identified the
+// exception is accepted (legacy blind behavior) so a descriptor-parse
+// surprise can never deadlock the bootstrap.
+static bool wait_verified_exception(mach_port_t port, ExceptionMessage *exc,
+                                    int timeoutMS, uint64_t expectedThread,
+                                    const char *what)
+{
+    if (timeoutMS <= 0)
+        timeoutMS = 1000;
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
+                            (now.tv_nsec - start.tv_nsec) / 1000000);
+        int remaining = timeoutMS - elapsed;
+        if (remaining <= 0)
+            return false;
+
+        if (!wait_exception(port, exc, remaining, false))
+            return false;
+
+        if (!expectedThread)
+            return true;
+
+        uint64_t raisedBy = exception_thread_kaddr(exc);
+        if (!raisedBy) {
+            printf("[RemoteCall] %s: exception sender unknown (id=%u size=%u) — accepting (fail-open)\n",
+                   what ?: "wait", exc->msgId, exc->msgSize);
+            return true;
+        }
+        if (raisedBy == expectedThread)
+            return true;
+
+        printf("[RemoteCall] %s: stray exception from thread %#llx (expected trojan %#llx, id=%u) — resuming it and keep waiting\n",
+               what ?: "wait", raisedBy, expectedThread, exc->msgId);
+        reply_with_state(exc, &exc->threadState);
+    }
+}
+
+// Best-effort bring-back of the hijacked thread before abandoning a LIVE
+// target. abandon_remote_call() intentionally never touches the remote task,
+// so without this the trojan stays parked mid-fault-loop with exception ports
+// that are about to be destroyed — the next fault becomes undeliverable and
+// the kernel terminates the thread (SpringBoard damage → respring cascade →
+// the next init attempt reports "process not found").
+static void restore_trojan_before_abandon(void)
+{
+    if (!g_RC_haveOriginalState)
+        return;
+    printf("[RemoteCall] restoring hijacked thread state before abandon…\n");
+    restore_trojan_thread(&g_RC_originalState);
+}
+
 uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
     uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)
@@ -816,9 +906,14 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     int floorTimeout = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 10000;
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
     uint64_t pcAddr = native_strip((uint64_t)dlsym(RTLD_DEFAULT, name));
+    if (!pcAddr) {
+        printf("[RemoteCall] do_temp: symbol not found: %s — aborting remote call (blind reply would re-fault the trojan with x0=0)\n", name ?: "(null)");
+        g_RC_success = false;
+        return 0;
+    }
 
     ExceptionMessage exc;
-    if (!wait_exception(g_RC_firstExceptionPort, &exc, newTimeout, false)) {
+    if (!wait_verified_exception(g_RC_firstExceptionPort, &exc, newTimeout, g_RC_trojanThreadAddr, "temp-call")) {
         printf("[%s:%d] Don't receive first exception on original thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
         return 0;
@@ -833,7 +928,11 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN_CREATOR);
-    reply_with_state(&exc, &exc.threadState);
+    if (!reply_with_state(&exc, &exc.threadState)) {
+        printf("[%s:%d] reply for %s failed — remote call aborted\n", __FUNCTION__, __LINE__, name ?: "?");
+        g_RC_success = false;
+        return 0;
+    }
 
     if (timeout < 0) {
         printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
@@ -841,7 +940,7 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     }
 
     ExceptionMessage exc2;
-    if (!wait_exception(g_RC_firstExceptionPort, &exc2, newTimeout, false)) {
+    if (!wait_verified_exception(g_RC_firstExceptionPort, &exc2, newTimeout, g_RC_trojanThreadAddr, "temp-call-ret")) {
         printf("[%s:%d] Don't receive second exception on original thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
         return 0;
@@ -851,6 +950,19 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
     if (remote_call_should_log_result(name, false))
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
     if(strcmp(name, "getpid") == 0 && retValue == 0) {
+        static bool getpidDiagDumped = false;
+        if (!getpidDiagDumped) {
+            getpidDiagDumped = true;
+            uint64_t raisedBy = exception_thread_kaddr(&exc2);
+            // Disambiguates the three known failure shapes of the bootstrap
+            // call: senderThread != trojanThread → stray-thread interleave;
+            // pc == callPc → getpid never executed (PAC/PC reply rejected);
+            // pc == fakeLr → getpid ran but x0 was not the return value.
+            printf("[RemoteCall] getpid bootstrap diagnostics: ret=0 pc=%#llx lr=%#llx sp=%#llx callPc=%#llx fakeLr=%#llx senderThread=%#llx trojanThread=%#llx msgId=%u msgSize=%u\n",
+                   exc2.threadState.__pc, exc2.threadState.__lr, exc2.threadState.__sp,
+                   pcAddr, (uint64_t)FAKE_LR_TROJAN_CREATOR, raisedBy, g_RC_trojanThreadAddr,
+                   exc2.msgId, exc2.msgSize);
+        }
         printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
     }
@@ -927,7 +1039,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     int newTimeout = (floorTimeout > timeout) ? floorTimeout : timeout;
 
     ExceptionMessage exc;
-    if (!wait_exception(g_RC_secondExceptionPort, &exc, newTimeout, false)) {
+    if (!wait_verified_exception(g_RC_secondExceptionPort, &exc, newTimeout, g_RC_callThreadAddr, "stable-call")) {
         printf("[%s:%d] Don't receive first exception on new thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
         return 0;
@@ -942,7 +1054,11 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     exc.threadState.__x[6] = x6;
     exc.threadState.__x[7] = x7;
     sign_state(g_RC_trojanThreadAddr, &exc.threadState, pcAddr, FAKE_LR_TROJAN);
-    reply_with_state(&exc, &exc.threadState);
+    if (!reply_with_state(&exc, &exc.threadState)) {
+        printf("[%s:%d] reply for %s failed — remote call aborted\n", __FUNCTION__, __LINE__, name ?: "(addr-call)");
+        g_RC_success = false;
+        return 0;
+    }
 
     if (timeout < 0) {
         printf("[%s:%d] Trojan thread cleanup\n", __FUNCTION__, __LINE__);
@@ -950,7 +1066,7 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     }
 
     ExceptionMessage exc2;
-    if (!wait_exception(g_RC_secondExceptionPort, &exc2, newTimeout, false)) {
+    if (!wait_verified_exception(g_RC_secondExceptionPort, &exc2, newTimeout, g_RC_callThreadAddr, "stable-call-ret")) {
         printf("[%s:%d] Don't receive second exception on new thread\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
         return 0;
@@ -967,7 +1083,7 @@ bool restore_trojan_thread(arm_thread_state64_internal *state)
     ExceptionMessage exc;
     int restoreTimeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 20000;
     if (restoreTimeoutMS < 1000) restoreTimeoutMS = 1000;
-    if (!wait_exception(g_RC_firstExceptionPort, &exc, restoreTimeoutMS, false)) {
+    if (!wait_verified_exception(g_RC_firstExceptionPort, &exc, restoreTimeoutMS, g_RC_trojanThreadAddr, "restore")) {
         printf("[%s:%d] Failed to receive exception while restoring within %dms\n",
                __FUNCTION__, __LINE__, restoreTimeoutMS);
         return false;
@@ -975,8 +1091,7 @@ bool restore_trojan_thread(arm_thread_state64_internal *state)
 
     state->__flags = exc.threadState.__flags;
     sign_state(g_RC_trojanThreadAddr, state, state->__pc, state->__lr);
-    reply_with_state(&exc, state);
-    return true;
+    return reply_with_state(&exc, state);
 }
 
 void abandon_remote_call(void) {
@@ -1017,6 +1132,7 @@ void abandon_remote_call_internal(void) {
     g_RC_dummyThreadTro = 0;
     g_RC_selfThreadAddr = 0;
     g_RC_selfThreadCtid = 0;
+    g_RC_haveOriginalState = false;
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
@@ -1083,6 +1199,7 @@ int destroy_remote_call_internal(void) {
     g_RC_dummyThreadTro = 0;
     g_RC_selfThreadAddr = 0;
     g_RC_selfThreadCtid = 0;
+    g_RC_haveOriginalState = false;
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
     g_RC_trojanThreadAddr = 0;
@@ -1633,7 +1750,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     int firstExceptionTimeoutMS = g_RC_firstExceptionTimeoutMS > 0 ? g_RC_firstExceptionTimeoutMS : 120000;
     RC_DEBUG("[%s:%d] First exception wait timeout=%dms\n",
              __FUNCTION__, __LINE__, firstExceptionTimeoutMS);
-    if(!wait_exception(firstExceptionPort, &exc, firstExceptionTimeoutMS, false)) {
+    if(!wait_verified_exception(firstExceptionPort, &exc, firstExceptionTimeoutMS, 0, "bootstrap-trap")) {
         printf("[%s:%d] Failed to receive first exception within %dms\n",
                __FUNCTION__, __LINE__, firstExceptionTimeoutMS);
         for (NSNumber *thread in g_RC_threadList) {
@@ -1646,6 +1763,31 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     printf("[RemoteCall] Thread trapped — hijacking execution inside %s.\n", process);
     memcpy(&g_RC_originalState, &exc.threadState, sizeof(arm_thread_state64_internal));
+    g_RC_haveOriginalState = true;
+
+    // Adopt the trapped thread as the trojan when it is one of the threads we
+    // injected: injection order and scheduling make the first trapper
+    // arbitrary, and every PAC signature is computed for the thread that will
+    // actually execute it. An unidentifiable sender keeps the legacy behavior
+    // (fail-open) instead of risking a mismatch.
+    do {
+        uint64_t trappedThread = exception_thread_kaddr(&exc);
+        if (!trappedThread) {
+            printf("[RemoteCall] bootstrap trap sender unknown (id=%u size=%u) — keeping default trojan %#llx\n",
+                   exc.msgId, exc.msgSize, g_RC_trojanThreadAddr);
+            break;
+        }
+        if (!exception_thread_is_injected(trappedThread)) {
+            printf("[RemoteCall] bootstrap trap from NON-injected thread %#llx (id=%u size=%u) — keeping default trojan %#llx\n",
+                   trappedThread, exc.msgId, exc.msgSize, g_RC_trojanThreadAddr);
+            break;
+        }
+        if (trappedThread != g_RC_trojanThreadAddr) {
+            printf("[RemoteCall] adopting trapped thread %#llx as trojan (was %#llx)\n",
+                   trappedThread, g_RC_trojanThreadAddr);
+            g_RC_trojanThreadAddr = trappedThread;
+        }
+    } while (0);
 
     for (NSNumber *thread in g_RC_threadList) {
         clear_guard_exception(thread.unsignedLongLongValue);
@@ -1663,7 +1805,13 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
 
     arm_thread_state64_internal newState = exc.threadState;
     sign_state(g_RC_trojanThreadAddr, &newState, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR);
-    reply_with_state(&exc, &newState);
+    if (!reply_with_state(&exc, &newState)) {
+        printf("[%s:%d] FAKE_PC reply failed — trojan thread cannot be launched\n",
+               __FUNCTION__, __LINE__);
+        remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        abandon_remote_call();
+        return -1;
+    }
 
     if (g_RC_originalThreadOnly) {
         g_RC_creatingExtraThread = false;
@@ -1686,6 +1834,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] bootstrap getpid failed before synthetic thread creation\n",
                __FUNCTION__, __LINE__);
         remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        restore_trojan_before_abandon();
         abandon_remote_call();
         return -1;
     }
@@ -1695,6 +1844,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] pthread_create_suspended_np remote call failed result=%llu\n",
                __FUNCTION__, __LINE__, createResult);
         remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        restore_trojan_before_abandon();
         abandon_remote_call();
         return -1;
     }
@@ -1706,6 +1856,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] pthread_create_suspended_np did not write a pthread pointer\n",
                __FUNCTION__, __LINE__);
         remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        restore_trojan_before_abandon();
         abandon_remote_call();
         return -1;
     }
@@ -1715,6 +1866,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] pthread_mach_thread_np remote call failed\n",
                __FUNCTION__, __LINE__);
         remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        restore_trojan_before_abandon();
         abandon_remote_call();
         return -1;
     }
@@ -1723,6 +1875,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] failed to resolve synthetic thread kobject port=0x%llx addr=%#llx\n",
                __FUNCTION__, __LINE__, callThreadPort, g_RC_callThreadAddr);
         remote_call_note_init_failure(RemoteCallInitFailureOther, targetPid);
+        restore_trojan_before_abandon();
         abandon_remote_call();
         return -1;
     }
