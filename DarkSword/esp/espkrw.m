@@ -218,9 +218,10 @@ int esp_krw_init(void) {
         return -2;
     }
 
-    // Step 3: find the game (sysctl first — TrollStore logic, kernel fallback)
-    pid_t pid = esp_find_game_pid_sysctl("FreeFire");
-    if (pid == -1) pid = esp_find_game_pid_kernel("FreeFire");
+    // Step 3: find the game (HYBRID: sysctl trước — TrollStore logic, kernel
+    // proc_find_by_name fallback — Task 18: sysctl-only bị sandbox chặn trên
+    // iOS 18 nên trước đây pipeline không bao giờ thấy game)
+    pid_t pid = esp_krw_find_game_pid("FreeFire");
     if (pid == -1) {
         ESPKRW_LOG("KHÔNG thấy tiến trình FreeFire — hãy mở game trước khi bật ESP");
         return -3;
@@ -309,9 +310,7 @@ bool esp_krw_ready(void) {
 }
 
 bool esp_krw_game_process_exists(void) {
-    pid_t pid = esp_find_game_pid_sysctl("FreeFire");
-    if (pid == -1) pid = esp_find_game_pid_kernel("FreeFire");
-    return pid != -1;
+    return esp_krw_find_game_pid("FreeFire") != -1;
 }
 
 // Sysctl-ONLY probe — never touches kernel R/W primitives, so it is safe in
@@ -320,4 +319,15 @@ bool esp_krw_game_process_exists(void) {
 // honest green/red rows without performing a single kernel read.
 bool esp_krw_game_process_exists_sysctl(void) {
     return esp_find_game_pid_sysctl("FreeFire") != -1;
+}
+
+// HYBRID probe — sysctl first (cheap; works on TrollStore-style unsandboxed
+// builds), kernel proc_find_by_name fallback (read-only, bounded walk — the
+// SAME lookup that has found SpringBoard pid=34 on this device). Task 18:
+// this is what makes the pipeline work on sandboxed iOS 18 where sysctl
+// KERN_PROC_ALL always fails.
+pid_t esp_krw_find_game_pid(const char *gameName) {
+    pid_t pid = esp_find_game_pid_sysctl(gameName);
+    if (pid == -1) pid = esp_find_game_pid_kernel(gameName);
+    return pid;
 }

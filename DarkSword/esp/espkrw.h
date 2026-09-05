@@ -77,6 +77,13 @@ bool esp_krw_game_process_exists(void);
 // appears, so the panel reflects reality without any kernel access.
 bool esp_krw_game_process_exists_sysctl(void);
 
+// HYBRID probe: sysctl trước, kernel proc_find_by_name fallback.
+// Task 18: trên iOS 18 app sandbox bị chặn sysctl(KERN_PROC_ALL) nên nhánh
+// sysctl luôn thất bại — không có kernel fallback thì cả pipeline tự khởi
+// chạy lẫn draw chain (GetGameProcesspid) không bao giờ thấy FreeFire dù
+// game đang chạy. Trả về -1 khi không thấy.
+pid_t esp_krw_find_game_pid(const char *gameName);
+
 #ifdef __cplusplus
 }
 #endif

@@ -61,7 +61,9 @@ struct ESPTab: View {
                 .foregroundStyle(.secondary)
 
             statusRow("Kernel R/W (Start Darksword)", esp.status.kernelReady)
-            statusRow("Root qua kernel (như TrollStore)", esp.status.rootElevated)
+            // Task 18: root elevation chỉ chạy trên iOS 26+; trên iOS 18 là
+            // bỏ qua CỐ Ý (kernel R/W là đủ) — đổi nhãn để không bị hiểu là lỗi.
+            statusRow("Root qua kernel (bỏ qua trên iOS 18 — không bắt buộc)", esp.status.rootElevated)
             statusRow("Tìm thấy FreeFire\(esp.status.pid > 0 ? " · pid \(esp.status.pid)" : "")", esp.status.gameFound)
             statusRow("Cầu task-port kernel", esp.status.portReady)
             statusRow("Cửa sổ ESP (đè lên game)", esp.status.overlayWindow)

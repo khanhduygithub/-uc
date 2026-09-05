@@ -527,7 +527,10 @@ self.statusLayer.shadowRadius    = 1.0f;
         // DarkSword remake: báo trạng thái game lên host thay vì exit(0)
         // (bản HUD cũ thoát process khi game đóng — ở đây app phải sống).
         esp_set_game_running(GetGameProcesspid((char *)"FreeFire") != -1);
-        if (Moudule_Base == (uint64_t)-1)
+        // Task 18: thử lại cả khi Moudule_Base == 0 (lần thử trước thất bại
+        // vì bridge chưa dựng/port chưa sẵn sàng) — chỉ kiểm tra == -1 thì
+        // process bị kẹt vĩnh viễn ở 0, không bao giờ vẽ lại được.
+        if (Moudule_Base == (uint64_t)-1 || Moudule_Base == 0)
             Moudule_Base = (uint64_t)GetGameModule_Base((char *)"FreeFire");
 
         if (!gESPPrefsLoadedOnce) {

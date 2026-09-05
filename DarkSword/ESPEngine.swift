@@ -77,7 +77,21 @@ final class ESPEngine: ObservableObject {
     /// user presses Start Darksword again).
     private var autoStartGeneration = 0
     /// How long auto-start keeps waiting for Free Fire before giving up.
-    private static let autoStartWaitLimit: TimeInterval = 180
+    /// 10 phút — user có thể bấm Start Darksword trước rồi mở game sau;
+    /// keep-alive audio giữ app sống suốt thời gian chờ nên chờ lâu không tốn gì.
+    private static let autoStartWaitLimit: TimeInterval = 600
+
+    // MARK: SpringBoard re-registration recovery (auto, bounded)
+    // Khi session fail lúc start (hoặc SpringBoard respring sau đó), overlay
+    // vẫn chạy nội bộ; vòng refresh tự thử đăng ký lại với cooldown. Mỗi lần
+    // thử đi qua poison gate của RemoteCall: SpringBoard còn "ô nhiễm" thì
+    // bị từ chối NGAY (không kernel write nào), SpringBoard mới (pid mới sau
+    // respring) thì mở được thật — thiết bị tự phục hồi không cần bấm lại.
+    private var sbRetryAttempts = 0
+    private var sbRetryInFlight = false
+    private var sbNextRetryAt = Date.distantPast
+    private static let sbRetryMax = 20
+    private static let sbRetryCooldown: TimeInterval = 15
     /// Bounded retries for kernel-bridge failures — never an infinite loop:
     /// every retry touches the kernel, and a dead primitive must stay dead
     /// (panic safety).
@@ -101,6 +115,10 @@ final class ESPEngine: ObservableObject {
         phase = .starting
         log("esp: ===== TỰ ĐỘNG KHỞI CHẠY ESP (sau Start Darksword) =====")
         lastMessage = "ESP tự khởi chạy — đang chờ Free Fire…"
+        // Keep-alive audio bật NGAY từ đầu: khi user rời app để mở game,
+        // iOS phải không được suspend process — nếu không toàn bộ pipeline
+        // (probe game, kernel bridge, session) đóng băng khi app vào nền.
+        esphost_start_keepalive()
         attemptAutoStart(delay: 1.0, generation: autoStartGeneration)
     }
 
@@ -120,9 +138,21 @@ final class ESPEngine: ObservableObject {
             }
 
             // Free Fire must exist BEFORE the kernel bridge is built so the
-            // port transplant targets a stable process. Sysctl-only probe —
-            // safe in every state, never touches the kernel.
-            if !esp_krw_game_process_exists_sysctl() {
+            // port transplant targets a stable process.
+            // Task 18 FIX: probe CHỈ-sysctl bị kẹt vĩnh viễn trên iOS 18 —
+            // app trong sandbox bị chặn sysctl(KERN_PROC_ALL) nên game không
+            // bao giờ "xuất hiện" dù đang chạy (đúng triệu chứng: log dừng ở
+            // "đang chờ Free Fire", tab ESP đỏ cả cột "Tìm thấy FreeFire"
+            // trong khi "Game đang chạy" xanh nhờ probe hybrid).
+            // Khi kernel R/W đã lên (điều kiện bắt buộc để được hàm này gọi),
+            // dùng probe HYBRID như esphost đã dùng: sysctl trước, kernel
+            // proc_find_by_name fallback (read-only, có bound 4096 node —
+            // chính là lookup đã tìm thấy SpringBoard pid=34). Trước khi có
+            // kernel R/W thì giữ nguyên probe sysctl-only cho an toàn.
+            let kernelUp = kexploit_krw_ready() || krw_persistence_is_recovered()
+            let gameAlive = kernelUp ? esp_krw_game_process_exists()
+                                     : esp_krw_game_process_exists_sysctl()
+            if !gameAlive {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.phase = .starting
@@ -155,10 +185,13 @@ final class ESPEngine: ObservableObject {
             }
 
             // 2. overlay + registration through the shared SpringBoard session.
-            // Bounded retry: a transient bootstrap failure (e.g. a thread that
-            // needed a beat after the hijack dance) must not kill the whole
-            // one-button chain — but never loop forever against the kernel.
-            var sessionFailure = DarkswordMechanism.acquireSessionForESP()
+            // Task 18: session thất bại KHÔNG còn giết cả chuỗi nữa — trước
+            // đây esp_host_start không bao giờ chạy khi session fail nên user
+            // không thấy GÌ cả. Giờ vẫn tạo window + tick + keep-alive
+            // (esp_host_start(false)); vòng refresh tự thử đăng ký lại vào
+            // SpringBoard với cooldown (poison gate khiến lần thử trên đích
+            // ô nhiễm bị từ chối tức thì, không đụng kernel).
+            var sessionFailure: String? = DarkswordMechanism.acquireSessionForESP()
             if sessionFailure != nil {
                 for attempt in 2...3 {
                     log("esp: \(sessionFailure!) — thử mở lại session sau 2 s (lần \(attempt)/3)…")
@@ -167,27 +200,36 @@ final class ESPEngine: ObservableObject {
                     if sessionFailure == nil { break }
                 }
             }
-            if let failure = sessionFailure {
-                self.autoStartPending = false
-                Task { @MainActor [weak self] in
-                    self?.finishStart(ok: false, message: failure)
-                }
-                return
-            }
-            defer { DarkswordMechanism.releaseSessionForESP() }
 
-            let rc = esp_host_start(true)
-            guard rc == 0 else {
-                self.autoStartPending = false
-                Task { @MainActor [weak self] in
-                    self?.finishStart(ok: false, message: "esp_host_start thất bại (\(rc)) — xem log [ESPHOST]")
+            if sessionFailure == nil {
+                let rc = esp_host_start(true)
+                DarkswordMechanism.releaseSessionForESP()
+                guard rc == 0 else {
+                    self.autoStartPending = false
+                    Task { @MainActor [weak self] in
+                        self?.finishStart(ok: false, message: "esp_host_start thất bại (\(rc)) — xem log [ESPHOST]")
+                    }
+                    return
                 }
-                return
+            } else {
+                log("esp: \(sessionFailure!) — vẫn chạy overlay nội bộ (bridge + cửa sổ + vẽ + keep-alive), tự thử đăng ký lại SpringBoard sau…")
+                let rc = esp_host_start(false)
+                guard rc == 0 else {
+                    self.autoStartPending = false
+                    Task { @MainActor [weak self] in
+                        self?.finishStart(ok: false, message: "esp_host_start(false) thất bại (\(rc)) — xem log [ESPHOST]")
+                    }
+                    return
+                }
             }
 
             self.autoStartPending = false
             Task { @MainActor [weak self] in
-                self?.finishStart(ok: true, message: "ESP đang chạy — quay lại game, khung ESP sẽ đè lên màn hình")
+                if sessionFailure == nil {
+                    self?.finishStart(ok: true, message: "ESP đang chạy — quay lại game, khung ESP sẽ đè lên màn hình")
+                } else {
+                    self?.finishStart(ok: true, message: "ESP chạy nửa cầu: kernel bridge + cửa sổ + vẽ OK, SpringBoard CHƯA đăng ký — sẽ tự thử lại; nếu vẫn đỏ sau vài phút hãy respring (tắt/mở lại màn hình không đủ — cần respring) rồi bấm Start Darksword")
+                }
             }
         }
     }
@@ -255,9 +297,15 @@ final class ESPEngine: ObservableObject {
         let kernelUp = kexploit_krw_ready() || krw_persistence_is_recovered()
         let gameAlive = kernelUp ? esp_krw_game_process_exists()
                                  : esp_krw_game_process_exists_sysctl()
+        // Root elevation là best-effort CHỈ cho iOS 26+ (sandbox_escape.m
+        // nhắm layout struct iOS 26). Trên iOS 17/18 esp_krw_init cố ý bỏ
+        // qua — kernel R/W là đủ — nên hàng này phải xanh theo nghĩa
+        // "không cần", nếu không user tưởng lỗi.
+        let rootDoneOrSkipped = getuid() == 0 ||
+            (kernelUp && ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26)
         return StatusSnapshot(
             kernelReady: kernelUp,
-            rootElevated: getuid() == 0,
+            rootElevated: rootDoneOrSkipped,
             gameFound: esp_krw_game_pid() > 0,
             gameProcessAlive: gameAlive,
             portReady: esp_krw_ready(),
@@ -301,6 +349,41 @@ final class ESPEngine: ObservableObject {
         timer.schedule(deadline: .now(), repeating: 2.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+
+            // Task 18: auto re-registration — overlay đang chạy nhưng chưa có
+            // mặt trong SpringBoard (session fail lúc start, hoặc SpringBoard
+            // respring làm mất đăng ký). Bounded + cooldown: SpringBoard còn
+            // "ô nhiễm" thì poison gate từ chối TỨC THÌ (không kernel write),
+            // SpringBoard mới sau respring thì mở thật — tự phục hồi.
+            var stNow = ESPHostStatus()
+            esp_host_get_status(&stNow)
+            if stNow.sbRegistered && self.sbRetryAttempts > 0 {
+                self.sbRetryAttempts = 0   // mở lại ngân sách cho lần respring kế tiếp
+            }
+            if stNow.overlayWindow, !stNow.sbRegistered,
+               !self.sbRetryInFlight,
+               self.sbRetryAttempts < Self.sbRetryMax,
+               Date() >= self.sbNextRetryAt {
+                self.sbRetryInFlight = true
+                self.sbRetryAttempts += 1
+                self.sbNextRetryAt = Date().addingTimeInterval(Self.sbRetryCooldown)
+                let attempt = self.sbRetryAttempts
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    guard let self else { return }
+                    var failure: String? = DarkswordMechanism.acquireSessionForESP()
+                    if failure == nil {
+                        let rc = esp_host_start(true)
+                        if rc != 0 { failure = "esp_host_start trả về \(rc)" }
+                        DarkswordMechanism.releaseSessionForESP()
+                    }
+                    if failure == nil {
+                        log("esp: đăng ký lại SpringBoard THÀNH CÔNG (lần thử \(attempt)) — overlay đã đè lên game")
+                    } else {
+                        log("esp: đăng ký lại SpringBoard thất bại (lần \(attempt)/\(Self.sbRetryMax)): \(failure!) — thử lại sau \(Int(Self.sbRetryCooldown))s; respring SpringBoard (khởi động lại SpringBoard) sẽ mở khóa")
+                    }
+                    self.sbRetryInFlight = false
+                }
+            }
 
             // Auto-heal: game restarted -> rebuild the transplanted port.
             // The overlay window/registration survives, only the kernel

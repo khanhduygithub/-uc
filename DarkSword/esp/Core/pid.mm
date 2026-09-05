@@ -8,6 +8,7 @@
 #import <limits.h>
 #import <sys/sysctl.h>
 #import <errno.h>
+#import <time.h>
 #import "pid.h"
 #import "../espkrw.h" // Để dùng dladdr nếu cần
 
@@ -20,32 +21,56 @@ static bool cachedBaseReset = false;   // DarkSword auto-heal flag
 #pragma mark - PID (sysctl, no libproc)
 
 pid_t GetGameProcesspid(char *GameProcessName) {
+    // Task 18 FIX (bắt buộc để ESP vẽ được trong sandbox iOS 18):
+    //
+    // 1) Fast path qua kernel bridge — pid đã được ghim khi dựng bridge
+    //    (esp_krw_init). KHÔNG đụng kernel ở đây: hàm này chạy 60Hz trong
+    //    tick vẽ (esp.mm updateFrame), một kernel walk mỗi frame là cơn bão
+    //    đọc kernel không cần thiết.
+    //
+    // 2) sysctl gốc của CrackTeam — rẻ, giữ cho bản không sandbox
+    //    (TrollStore) và cho trạng thái trước Start Darksword. Trên iOS 18
+    //    sandboxed thì NHÁNH NÀY LUÔN THẤT BẠI (EPERM) — đây là lý do trước
+    //    đây Moudule_Base không bao giờ tìm được UnityFramework.
+    //
+    // 3) Kernel fallback (proc_find_by_name) CÓ THROTTLE 1 lần/giây — chỉ
+    //    chạy khi (1) và (2) đều thất bại, tức bridge chưa dựng mà sysctl
+    //    bị chặn. Kernel walk có bound 4096 node, read-only, đã được chứng
+    //    minh trên máy này (tìm thấy SpringBoard pid=34).
+    pid_t bridged = esp_krw_game_pid();
+    if (bridged > 0) return bridged;
+
     size_t length = 0;
     static const int name[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     int err = sysctl((int *)name, (sizeof(name) / sizeof(*name)) - 1, NULL, &length, NULL, 0);
     if (err == -1) err = errno;
-    if (err != 0) return -1;
-
-    struct kinfo_proc *procBuffer = (struct kinfo_proc *)malloc(length);
-    if (!procBuffer) return -1;
-
-    err = sysctl((int *)name, (sizeof(name) / sizeof(*name)) - 1, procBuffer, &length, NULL, 0);
-    if (err == -1) {
-        free(procBuffer);
-        return -1;
-    }
-
-    int count = (int)(length / sizeof(struct kinfo_proc));
-    for (int i = 0; i < count; i++) {
-        const char *procname = procBuffer[i].kp_proc.p_comm;
-        if (strstr(procname, GameProcessName)) {
-            pid_t pid = procBuffer[i].kp_proc.p_pid;
+    if (err == 0) {
+        struct kinfo_proc *procBuffer = (struct kinfo_proc *)malloc(length);
+        if (procBuffer) {
+            err = sysctl((int *)name, (sizeof(name) / sizeof(*name)) - 1, procBuffer, &length, NULL, 0);
+            if (err != -1) {
+                int count = (int)(length / sizeof(struct kinfo_proc));
+                for (int i = 0; i < count; i++) {
+                    const char *procname = procBuffer[i].kp_proc.p_comm;
+                    if (strstr(procname, GameProcessName)) {
+                        pid_t pid = procBuffer[i].kp_proc.p_pid;
+                        free(procBuffer);
+                        return pid;
+                    }
+                }
+            }
             free(procBuffer);
-            return pid;
         }
     }
-    free(procBuffer);
-    return -1;
+
+    static struct timespec lastKernelProbe = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsedMs = (now.tv_sec - lastKernelProbe.tv_sec) * 1000L
+                   + (now.tv_nsec - lastKernelProbe.tv_nsec) / 1000000L;
+    if (elapsedMs < 1000) return -1;
+    lastKernelProbe = now;
+    return esp_krw_find_game_pid(GameProcessName);
 }
 
 #pragma mark - Module base (dyld, chính xác theo image name)

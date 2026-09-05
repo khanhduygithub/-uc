@@ -161,7 +161,11 @@ int esp_host_register_in_springboard(void) {
 
 #pragma mark - Audio keep-alive
 
-static void esphost_start_keepalive(void) {
+// Task 18: không còn static — ESPEngine gọi NGAY từ autoStartAfterKernel
+// (trước khi user rời app sang game): iOS chỉ không-suspend process có
+// audio đang phát, nên keep-alive phải bật TRƯỚC lúc app vào nền, không
+// phải chờ tới khi esp_host_start hoàn tất.
+void esphost_start_keepalive(void) {
     if (g_silence) return;
     @try {
         NSError *err = nil;
@@ -189,7 +193,7 @@ static void esphost_start_keepalive(void) {
     }
 }
 
-static void esphost_stop_keepalive(void) {
+void esphost_stop_keepalive(void) {
     if (g_silence) {
         [g_silence stop];
         g_silence = nil;
@@ -236,6 +240,18 @@ static void esphost_stop_tick(void) {
 
 int esp_host_start(bool registerInSB) {
     if (g_window) {
+        // Task 18: overlay đã sống — thứ duy nhất có thể còn thiếu là đăng ký
+        // SpringBoard (lần start đầu chạy KHÔNG session, hoặc SpringBoard
+        // respring làm mất đăng ký). Thử đăng ký luôn thay vì returning 0
+        // câm lặng — khi đó pipeline “thành công” mà overlay không bao giờ
+        // đè lên game được. Caller phải đang GIỮ session khi registerInSB.
+        if (registerInSB && !atomic_load(&g_sbRegistered)) {
+            int reg = esp_host_register_in_springboard();
+            if (reg != 0) {
+                ESPHOST_LOG("đăng ký lại SpringBoard thất bại (%d) — window giữ nguyên, sẽ thử lại", reg);
+                return reg;
+            }
+        }
         ESPHOST_LOG("overlay đang chạy");
         return 0;
     }

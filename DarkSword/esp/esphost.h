@@ -77,6 +77,13 @@ void esphost_reload_esp_prefs(void);
 // game mới — xoá cache module base để ESP bắt lại UnityFramework.
 void esphost_on_game_relaunched(void);
 
+// Audio keep-alive (silent loop + UIBackgroundModes=audio) — giữ process
+// không bị suspend khi app vào nền. ESPEngine bật NGAY sau Start Darksword
+// (trước khi user rời app sang game), không chờ tới esp_host_start.
+// Idempotent: gọi nhiều lần không sao. esp_host_stop() tự gọi stop.
+void esphost_start_keepalive(void);
+void esphost_stop_keepalive(void);
+
 #ifdef __cplusplus
 }
 #endif
