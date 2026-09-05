@@ -1467,6 +1467,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (!is_kaddr_valid(dummyThreadAddr)) {
         printf("[%s:%d] failed to resolve dummy thread kobject mach=0x%x addr=%#llx\n",
                __FUNCTION__, __LINE__, dummyThreadMach, dummyThreadAddr);
+        kutils_dump_ipc_lookup(selfTask, dummyThreadMach);
         pthread_cancel(dummyThread);
         mach_port_deallocate(mach_task_self_, dummyThreadMach);
         destroy_exception_port(firstExceptionPort);

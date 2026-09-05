@@ -136,6 +136,12 @@ static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_
     uint32_t newBits  = (selfBits & ESP_IO_ACTIVE) | ESP_IKOT_TASK;
     if (!(newBits & ESP_IO_ACTIVE)) newBits |= ESP_IO_ACTIVE;
 
+    // Snapshot the entry's ORIGINAL values so the rollback below restores
+    // exactly what was there before (writing generic cleanup values over an
+    // entry that belongs to an unrelated port would corrupt it).
+    uint32_t origBits = kread32(portKaddr);
+    uint64_t origKobject = kread64(portKaddr + off_ipc_port_ip_kobject);
+
     // Transplant: type -> IKOT_TASK, kobject -> game task.
     kwrite32(portKaddr, newBits);
     kwrite64(portKaddr + off_ipc_port_ip_kobject, gameTaskKaddr);
@@ -143,10 +149,10 @@ static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_
     // Verify through the same helper path the kernel will use later.
     uint64_t check = task_get_ipc_port_kobject(g_espSelfTaskKaddr, port);
     if (check != gameTaskKaddr) {
-        ESPKRW_LOG("verify kobject thất bại (read=0x%llx expect=0x%llx) — hoàn tác",
-                   check, gameTaskKaddr);
-        kwrite32(portKaddr, ESP_IO_ACTIVE);          // IO_ACTIVE | IKOT_NONE
-        kwrite64(portKaddr + off_ipc_port_ip_kobject, 0);
+        ESPKRW_LOG("verify kobject thất bại (read=0x%llx expect=0x%llx) — hoàn tác giá trị gốc (bits=0x%08x kobject=0x%llx)",
+                   check, gameTaskKaddr, origBits, origKobject);
+        kwrite32(portKaddr, origBits);
+        kwrite64(portKaddr + off_ipc_port_ip_kobject, origKobject);
         return KERN_FAILURE;
     }
 
