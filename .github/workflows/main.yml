@@ -1,146 +1,133 @@
-name: Build Objective-C++ Object Files
+name: Unzip darksword.zip & Build
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'obf.h'
-      - 'obf.mm'
-      - 'DuyKeyAuth.mm'
-      - '.github/workflows/**'
-  pull_request:
-    branches: [ main, master ]
-    paths:
-      - 'obf.h'
-      - 'obf.mm'
-      - 'DuyKeyAuth.mm'
   workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "darksword.zip"
+      - "DarkSword.zip"
+      - ".github/workflows/unzip.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "darksword.zip"
+      - "DarkSword.zip"
+      - ".github/workflows/unzip.yml"
+
+permissions:
+  contents: write  # Cần quyền write để push lên repo
 
 jobs:
-  build:
-    runs-on: macos-latest
-    
-    strategy:
-      matrix:
-        arch: [x86_64, arm64]
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Show Xcode version
-      run: |
-        xcodebuild -version
-        echo "SDK Path: $(xcrun --sdk macosx --show-sdk-path)"
-    
-    - name: Build obf.o
-      run: |
-        clang++ -c obf.mm \
-          -o obf_${{ matrix.arch }}.o \
-          -arch ${{ matrix.arch }} \
-          -std=c++17 \
-          -O2 \
-          -fobjc-arc \
-          -isysroot $(xcrun --sdk macosx --show-sdk-path) \
-          -mmacosx-version-min=10.15
-    
-    - name: Build DuyKeyAuth.o
-      run: |
-        clang++ -c DuyKeyAuth.mm \
-          -o DuyKeyAuth_${{ matrix.arch }}.o \
-          -arch ${{ matrix.arch }} \
-          -std=c++17 \
-          -O2 \
-          -fobjc-arc \
-          -isysroot $(xcrun --sdk macosx --show-sdk-path) \
-          -mmacosx-version-min=10.15
-    
-    - name: Upload object files
-      uses: actions/upload-artifact@v4
-      with:
-        name: object-files-${{ matrix.arch }}
-        path: |
-          obf_${{ matrix.arch }}.o
-          DuyKeyAuth_${{ matrix.arch }}.o
-        retention-days: 30
+  unzip-build:
+    name: Giai nen darksword.zip -> Push to repo -> Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 40
 
-  create-universal:
-    needs: build
-    runs-on: macos-latest
-    if: success()
-    
     steps:
-    - name: Download x86_64 objects
-      uses: actions/download-artifact@v4
-      with:
-        name: object-files-x86_64
-        path: x86_64
-    
-    - name: Download arm64 objects
-      uses: actions/download-artifact@v4
-      with:
-        name: object-files-arm64
-        path: arm64
-    
-    - name: Create universal binaries
-      run: |
-        mkdir -p universal
-        
-        # Create universal obf.o
-        lipo -create \
-          x86_64/obf_x86_64.o \
-          arm64/obf_arm64.o \
-          -output universal/obf.o
-        
-        # Create universal DuyKeyAuth.o
-        lipo -create \
-          x86_64/DuyKeyAuth_x86_64.o \
-          arm64/DuyKeyAuth_arm64.o \
-          -output universal/DuyKeyAuth.o
-        
-        echo "Created universal object files:"
-        ls -la universal/
-        echo "Architecture info:"
-        lipo -info universal/*.o
-    
-    - name: Upload universal binaries
-      uses: actions/upload-artifact@v4
-      with:
-        name: universal-object-files
-        path: universal/*.o
-        retention-days: 30
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Lấy full history để push
 
-  verify:
-    needs: [build, create-universal]
-    runs-on: macos-latest
-    
-    steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-    
-    - name: Verify object files
-      run: |
-        echo "=== Architecture-specific builds ==="
-        echo "x86_64 builds:"
-        if [ -d "object-files-x86_64" ]; then
-          for file in object-files-x86_64/*.o; do
-            echo "  File: $file"
-            file "$file" | grep -o 'x86_64\|arm64\|Mach-O'
-          done
-        fi
-        
-        echo -e "\narm64 builds:"
-        if [ -d "object-files-arm64" ]; then
-          for file in object-files-arm64/*.o; do
-            echo "  File: $file"
-            file "$file" | grep -o 'x86_64\|arm64\|Mach-O'
-          done
-        fi
-        
-        echo -e "\n=== Universal binaries ==="
-        if [ -d "universal-object-files" ]; then
-          for file in universal-object-files/*.o; do
-            echo "  File: $file"
-            lipo -info "$file" 2>/dev/null || file "$file"
-          done
-        fi
+      - name: Locate darksword.zip
+        id: zip
+        run: |
+          set -e
+          ZIP="darksword.zip"
+          if [ ! -f "$ZIP" ]; then
+            ZIP=$(find . -maxdepth 2 -iname "darksword.zip" -not -path "./.git/*" | head -n 1)
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "::error::Khong tim thay darksword.zip o goc repo."
+            exit 1
+          fi
+          echo "Da tim thay: $ZIP"
+          ls -lh "$ZIP"
+          echo "zip_path=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip darksword.zip to repo
+        run: |
+          set -e
+          # Giải nén trực tiếp vào root của repo
+          unzip -oq "${{ steps.zip.outputs.zip_path }}" -d .
+          
+          echo "===== Cau truc thu muc sau khi giai nen ====="
+          find . -maxdepth 2 -type d -not -path "./.git/*" | sort
+          
+          PROJ_COUNT=$(find . -type d -name "*.xcodeproj" -not -path "./.git/*" | wc -l | tr -d ' ')
+          if [ "$PROJ_COUNT" -eq 0 ]; then
+            echo "::error::Trong darksword.zip khong co .xcodeproj"
+            exit 1
+          fi
+          echo "Tim thay $PROJ_COUNT .xcodeproj."
+
+      - name: Commit extracted files to repository
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Thêm tất cả file đã giải nén
+          git add -A
+          
+          # Kiểm tra có thay đổi không
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Extract source code from darksword.zip"
+            git push
+            echo "Pushed extracted source to repository"
+          fi
+
+      - name: Select latest Xcode
+        run: |
+          set -e
+          XCODE_APP=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Locate Xcode project & scheme
+        id: proj
+        run: |
+          set -e
+          PROJ=$(find . -type d -name "*.xcodeproj" -not -path "./.git/*" | head -n 1)
+          echo "Project: $PROJ"
+          xcodebuild -list -project "$PROJ"
+          echo "proj_path=$PROJ" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Release, unsigned, device)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "${{ steps.proj.outputs.proj_path }}" \
+            -scheme DarkSword \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            | tee build.log | grep -E "(=== BUILD|error:|BUILD (SUCCEEDED|FAILED))" || true
+          test -d "build/Build/Products/Release-iphoneos/DarkSword.app"
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/DarkSword.app" "Payload/DarkSword.app"
+          zip -qry "DarkSword-${GITHUB_REF_NAME}-from-zip-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh *.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkSword-from-zip-unsigned-ipa
+          path: |
+            *.ipa
+            build.log
+          if-no-files-found: error
+          retention-days: 14
