@@ -117,6 +117,13 @@ final class AppState: ObservableObject {
             } else {
                 log("app: darksword thành công — kernel access đang hoạt động")
             }
+            // ONE button, everything chained: darksword chạy xong → đến lượt
+            // tất cả cái khác. ESP tự khởi chạy ngay khi kernel R/W còn tươi
+            // (chờ Free Fire nếu game chưa mở) — không cần bấm Bật ESP riêng,
+            // tránh khởi chạy trên primitive đã chết (nguyên nhân panic).
+            Task { @MainActor in
+                ESPEngine.shared.autoStartAfterKernel()
+            }
         } else {
             phase = .failed
             exploitStatus = .failed(method: "kexploit", code: -1)

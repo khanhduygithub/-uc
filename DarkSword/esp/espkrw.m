@@ -25,6 +25,7 @@
 
 #import "espkrw.h"
 
+#import <Foundation/Foundation.h>
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/krw.h"
 #import "../kexploit/kutils.h"
@@ -175,20 +176,33 @@ int esp_krw_init(void) {
     }
     ESPKRW_LOG("kernel R/W sẵn sàng");
 
-    // Step 2: sandbox escape + root (best effort — kernel path không bắt buộc,
-    // nhưng root giúp sysctl nhìn thấy toàn bộ process list như TrollStore).
+    // Step 2: sandbox escape + root — iOS 26+ ONLY. sandbox_escape.m and
+    // sandbox_elevate_to_root target FilzaSlop's iOS 26 struct layout: on
+    // iOS 17/18 the chain walk reads garbage and issues blind kernel writes
+    // (which is what killed the socket primitive right after Start Darksword
+    // on 18.5), and sandbox_elevate_to_root writes self_proc+0x10 — the
+    // self->task field on iOS 18 — a guaranteed kernel panic. The ESP bridge
+    // only needs kernel R/W (sysctl + port transplant), so skip both below
+    // iOS 26 entirely.
     if (!g_espRootTried) {
         g_espRootTried = true;
-        uint64_t selfProc = proc_self();
-        if (selfProc) {
-            if (!sandbox_access_is_active()) {
-                int sbx = sandbox_escape(selfProc);
-                ESPKRW_LOG("sandbox_escape -> %d", sbx);
+        NSOperatingSystemVersion espOsv =
+            [[NSProcessInfo processInfo] operatingSystemVersion];
+        if (espOsv.majorVersion >= 26) {
+            uint64_t selfProc = proc_self();
+            if (selfProc) {
+                if (!sandbox_access_is_active()) {
+                    int sbx = sandbox_escape(selfProc);
+                    ESPKRW_LOG("sandbox_escape -> %d", sbx);
+                }
+                int root = sandbox_elevate_to_root(selfProc);
+                ESPKRW_LOG("sandbox_elevate_to_root -> %d (uid=%d)", root, getuid());
+            } else {
+                ESPKRW_LOG("proc_self() = 0 — bỏ qua bước root");
             }
-            int root = sandbox_elevate_to_root(selfProc);
-            ESPKRW_LOG("sandbox_elevate_to_root -> %d (uid=%d)", root, getuid());
         } else {
-            ESPKRW_LOG("proc_self() = 0 — bỏ qua bước root");
+            ESPKRW_LOG("iOS %ld — bỏ qua sandbox escape/root (kernel R/W là đủ)",
+                       (long)espOsv.majorVersion);
         }
     }
 

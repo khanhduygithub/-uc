@@ -7,7 +7,7 @@ import SwiftUI
 /// as a green/red (xanh/đỏ) live notification.
 struct ESPTab: View {
     @EnvironmentObject private var appState: AppState
-    @StateObject private var esp = ESPEngine()
+    @ObservedObject private var esp = ESPEngine.shared
 
     var body: some View {
         ScrollView {
@@ -91,34 +91,10 @@ struct ESPTab: View {
         }
     }
 
-    // MARK: Control card
+    // MARK: Control card (status only — no Bật/Dừng ESP button)
 
     private var controlCard: some View {
         VStack(spacing: 10) {
-            Button {
-                if esp.isRunning { esp.stopESP() } else { esp.startESP() }
-            } label: {
-                HStack(spacing: 8) {
-                    if esp.busy {
-                        ProgressView().tint(.white)
-                        Text("Đang xử lý…").fontWeight(.semibold)
-                    } else if esp.isRunning {
-                        Image(systemName: "stop.fill")
-                        Text("Dừng ESP").fontWeight(.semibold)
-                    } else {
-                        Image(systemName: "play.fill")
-                        Text("Bật ESP").fontWeight(.semibold)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 48)
-                .background(RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    .fill(esp.busy ? Color.gray : (esp.isRunning ? Color.red : Color.green)))
-                .foregroundStyle(.white)
-            }
-            .buttonStyle(.plain)
-            .disabled(esp.busy || (!esp.isRunning && !kernelAvailable))
-
             Button {
                 esp.launchGame()
             } label: {
@@ -133,7 +109,6 @@ struct ESPTab: View {
                 .foregroundStyle(Color.accentColor)
             }
             .buttonStyle(.plain)
-            .disabled(esp.busy || !kernelAvailable)
 
             Text(esp.lastMessage)
                 .font(.caption)
@@ -148,19 +123,15 @@ struct ESPTab: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if !kernelAvailable {
-                Text("Cần chạy Start Darksword (tab Darksword) để có kernel R/W trước khi bật ESP.")
+            if esp.phase == .idle {
+                Text("ESP tự khởi chạy khi Start Darksword thành công — tab này chỉ hiển thị trạng thái.")
                     .font(.caption2)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity)
         .cardBackground()
-    }
-
-    private var kernelAvailable: Bool {
-        esp.status.kernelReady || appState.phase == .succeeded
     }
 
     private var messageColor: Color {

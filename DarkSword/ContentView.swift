@@ -437,11 +437,13 @@ private struct MechanismPanel: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if !DarkswordMechanism.kernelReady {
-                Text("Cần chạy Start Darksword (kernel R/W) trước khi áp dụng cơ chế.")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-            }
+            // NOTE (per runtime-flow request): the old "kernel R/W chưa sẵn
+            // sàng" hint is GONE. It read DarkswordMechanism.kernelReady on
+            // EVERY body re-render (i.e. on every log line) — each read poked
+            // the socket primitive with setsockopt, flooding the log with
+            // "[KRW] not ready" lines and risking a kernel panic on a dead
+            // primitive. Mechanism buttons still validate kernel state when
+            // actually pressed.
         }
     }
 

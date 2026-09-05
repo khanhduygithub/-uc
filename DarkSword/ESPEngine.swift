@@ -18,6 +18,10 @@ import Darwin
 @MainActor
 final class ESPEngine: ObservableObject {
 
+    /// Shared engine: AppState chains it right after "Start Darksword" and
+    /// the ESP tab observes the same instance — one pipeline for the app.
+    static let shared = ESPEngine()
+
     // MARK: - Nested types
 
     struct StatusSnapshot: Equatable {
@@ -43,7 +47,7 @@ final class ESPEngine: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var status = StatusSnapshot()
-    @Published private(set) var lastMessage: String = "Sẵn sàng — bấm Bật ESP sau khi đã Start Darksword và mở Free Fire"
+    @Published private(set) var lastMessage: String = "Sẵn sàng — ESP tự khởi chạy khi Start Darksword thành công, hãy mở Free Fire để ESP ghim mục tiêu"
     @Published private(set) var busy = false
     @Published var config = ESPConfig()
 
@@ -63,20 +67,85 @@ final class ESPEngine: ObservableObject {
     private var refreshTimer: DispatchSourceTimer?
     private var healAttempts = 0
 
-    // MARK: - Start / Stop
+    /// Auto-start bookkeeping (touched on `queue` / main thread).
+    private var autoStartPending = false
+    private var autoStartAttempts = 0
+    private var autoStartDeadline = Date.distantFuture
+    /// Bumped on every autoStartAfterKernel(); in-flight attempt chains with
+    /// an older generation exit silently (prevents double pipelines when the
+    /// user presses Start Darksword again).
+    private var autoStartGeneration = 0
+    /// How long auto-start keeps waiting for Free Fire before giving up.
+    private static let autoStartWaitLimit: TimeInterval = 180
+    /// Bounded retries for kernel-bridge failures — never an infinite loop:
+    /// every retry touches the kernel, and a dead primitive must stay dead
+    /// (panic safety).
+    private static let autoStartMaxAttempts = 5
 
-    func startESP() {
-        guard !busy else { return }
+    // MARK: - Auto start (one-button flow)
+
+    /// "Start Darksword" is the ONLY button. AppState calls this right after
+    /// the kernel exploit succeeds; the ESP pipeline then runs by itself:
+    /// it waits for Free Fire to appear (the user may open the game later),
+    /// builds the kernel bridge, the overlay and the SpringBoard registration
+    /// with no further press. There is no separate Bật ESP button anymore —
+    /// the ESP tab is status-only (xanh/đỏ).
+    func autoStartAfterKernel() {
+        applyConfig()
+        autoStartPending = true
+        autoStartAttempts = 0
+        autoStartGeneration += 1
+        autoStartDeadline = Date().addingTimeInterval(Self.autoStartWaitLimit)
         busy = true
         phase = .starting
-        log("esp: ===== BẬT ESP FREE FIRE =====")
+        log("esp: ===== TỰ ĐỘNG KHỞI CHẠY ESP (sau Start Darksword) =====")
+        lastMessage = "ESP tự khởi chạy — đang chờ Free Fire…"
+        attemptAutoStart(delay: 1.0, generation: autoStartGeneration)
+    }
 
-        queue.async { [weak self] in
+    private func attemptAutoStart(delay: TimeInterval, generation: Int) {
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            // A newer Start Darksword run owns the pipeline now — step aside.
+            guard self.autoStartPending, self.autoStartGeneration == generation else { return }
 
-            // 1. kernel bridge (includes root elevate + game find + transplant)
+            guard Date() < self.autoStartDeadline else {
+                self.autoStartPending = false
+                Task { @MainActor [weak self] in
+                    self?.finishStart(ok: false, message:
+                        "hết thời gian chờ Free Fire (\(Int(Self.autoStartWaitLimit))s) — mở game rồi bấm Start Darksword để chạy lại toàn bộ luồng")
+                }
+                return
+            }
+
+            // Free Fire must exist BEFORE the kernel bridge is built so the
+            // port transplant targets a stable process. Sysctl-only probe —
+            // safe in every state, never touches the kernel.
+            if !esp_krw_game_process_exists_sysctl() {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.phase = .starting
+                    self.lastMessage = "ESP sẵn sàng — đang chờ Free Fire khởi động…"
+                }
+                self.attemptAutoStart(delay: 2.0, generation: generation)
+                return
+            }
+
             let kr = esp_krw_init()
             guard kr == 0 else {
+                if kr == -3 {
+                    // game vanished between the probe and the bridge build —
+                    // go back to waiting instead of failing
+                    self.attemptAutoStart(delay: 2.0, generation: generation)
+                    return
+                }
+                self.autoStartAttempts += 1
+                if self.autoStartAttempts < Self.autoStartMaxAttempts {
+                    log("esp: dựng kernel bridge chưa xong (esp_krw_init=\(kr)) — thử lại sau 3 s (lần \(self.autoStartAttempts)/\(Self.autoStartMaxAttempts))")
+                    self.attemptAutoStart(delay: 3.0, generation: generation)
+                    return
+                }
+                self.autoStartPending = false
                 let message = self.describeKrwFailure(kr)
                 Task { @MainActor [weak self] in
                     self?.finishStart(ok: false, message: message)
@@ -86,6 +155,7 @@ final class ESPEngine: ObservableObject {
 
             // 2. overlay + registration through the shared SpringBoard session
             if let sessionFailure = DarkswordMechanism.acquireSessionForESP() {
+                self.autoStartPending = false
                 Task { @MainActor [weak self] in
                     self?.finishStart(ok: false, message: sessionFailure)
                 }
@@ -95,12 +165,14 @@ final class ESPEngine: ObservableObject {
 
             let rc = esp_host_start(true)
             guard rc == 0 else {
+                self.autoStartPending = false
                 Task { @MainActor [weak self] in
                     self?.finishStart(ok: false, message: "esp_host_start thất bại (\(rc)) — xem log [ESPHOST]")
                 }
                 return
             }
 
+            self.autoStartPending = false
             Task { @MainActor [weak self] in
                 self?.finishStart(ok: true, message: "ESP đang chạy — quay lại game, khung ESP sẽ đè lên màn hình")
             }
@@ -109,6 +181,7 @@ final class ESPEngine: ObservableObject {
 
     func stopESP() {
         guard !busy else { return }
+        autoStartPending = false
         busy = true
         phase = .stopping
 
@@ -122,7 +195,7 @@ final class ESPEngine: ObservableObject {
                 self.busy = false
                 self.phase = .idle
                 self.status = StatusSnapshot()
-                self.lastMessage = "ESP đã dừng"
+                self.lastMessage = "ESP đã dừng — bấm Start Darksword để chạy lại toàn bộ luồng"
                 log("esp: ===== ESP ĐÃ DỪNG =====")
             }
         }
@@ -147,8 +220,8 @@ final class ESPEngine: ObservableObject {
     /// to the main actor).
     private nonisolated func describeKrwFailure(_ code: Int32) -> String {
         switch code {
-        case -1: return "kernel R/W chưa hoạt động — bấm Start Darksword ở tab Darksword trước"
-        case -3: return "không thấy tiến trình FreeFire — hãy mở game rồi bật ESP lại"
+        case -1: return "kernel R/W chưa hoạt động — Start Darksword phải thành công trước (khởi động lại app rồi chạy lại nếu vừa thất bại)"
+        case -3: return "không thấy tiến trình FreeFire — hãy mở game, ESP tự ghim khi game xuất hiện"
         case -2, -4, -5: return "không đọc được proc/task của game qua kernel (\(code))"
         case -6: return "port transplant thất bại (\(code)) — xem log [ESPKRW]"
         default: return "esp_krw_init lỗi \(code)"
@@ -202,8 +275,8 @@ final class ESPEngine: ObservableObject {
                 self.status = snapshot
                 if self.phase == .idle {
                     self.lastMessage = snapshot.kernelReady
-                        ? "Kernel R/W đang hoạt động — bấm Bật ESP sau khi đã mở Free Fire"
-                        : "Chưa có kernel R/W — bấm Start Darksword ở tab Darksword trước"
+                        ? "Kernel R/W hoạt động — ESP tự khởi chạy, mở Free Fire nếu chưa mở"
+                        : "Chưa có kernel R/W — bấm Start Darksword, ESP sẽ tự khởi chạy khi thành công"
                 }
             }
         }
@@ -254,9 +327,12 @@ final class ESPEngine: ObservableObject {
 
     // MARK: - Launch game
 
+    /// Launch Free Fire through SpringBoard. Runs alongside a pending
+    /// auto-start on purpose — the waiting ESP pipeline picks the game up as
+    /// soon as it appears (never touches `busy`, which belongs to the
+    /// start/stop pipeline).
     func launchGame() {
-        guard !busy else { return }
-        busy = true
+        if busy && !autoStartPending { return }
         queue.async { [weak self] in
             guard let self else { return }
             var message: String
@@ -270,7 +346,6 @@ final class ESPEngine: ObservableObject {
                     : "mở game thất bại (\(rc)) — SpringBoard không có đường dẫn phù hợp"
             }
             DispatchQueue.main.async {
-                self.busy = false
                 self.lastMessage = message
                 log("esp: \(message)")
             }
