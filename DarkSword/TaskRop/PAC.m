@@ -96,7 +96,10 @@ uint64_t find_pacia_gadget(void)
     // Dò gadget trong vùng __TEXT của một image (trang đã map — đọc trực tiếp
     // an toàn). Giới hạn 32MB/image để không paging cả shared cache.
     static const uint64_t kMaxScanBytes = 32ULL * 1024 * 1024;
-    auto scanImage = ^(const struct mach_header *mh, const char *name) {
+    // NOTE (build 11 fix): `auto` chỉ hợp lệ ở ObjC++ — file này là ObjC thuần
+    // nên phải khai báo kiểu block tường minh.
+    uint64_t (^scanImage)(const struct mach_header *mh, const char *name) =
+        ^uint64_t (const struct mach_header *mh, const char *name) {
         if (!mh || mh->magic != MH_MAGIC_64) return (uint64_t)0;
         const uint8_t *cmd = (const uint8_t *)mh + sizeof(struct mach_header_64);
         for (uint32_t c = 0; c < mh->ncmds; c++) {
