@@ -7,6 +7,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -14,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Select Xcode 16
         run: |
@@ -41,14 +46,16 @@ jobs:
 
       - name: Build XPF Library
         run: |
-          make -C darksword-kexploit-fun/XPF output/ios/libxpf.dylib
+          mkdir -p build/logs
+          make -C darksword-kexploit-fun/XPF output/ios/libxpf.dylib 2>&1 | tee build/logs/xpf-build.log
 
       - name: Show Xcode Version
         run: |
-          xcodebuild -version
+          xcodebuild -version | tee -a build/logs/xcode-version.log
 
       - name: Build Xcode Project
         run: |
+          set -o pipefail
           xcodebuild -project darksword-kexploit-fun.xcodeproj \
                      -scheme darksword-kexploit-fun \
                      -sdk iphoneos \
@@ -57,7 +64,7 @@ jobs:
                      CODE_SIGNING_ALLOWED=NO \
                      -configuration Release \
                      -derivedDataPath build/DerivedData \
-                     clean build
+                     clean build 2>&1 | tee build/logs/xcodebuild.log
 
       - name: Package App into IPA
         run: |
@@ -66,8 +73,65 @@ jobs:
           cd build
           zip -r darksword-kexploit-fun.ipa Payload
 
-      - name: Upload Build Artifact
+      - name: Collect build summary
+        if: always()
+        run: |
+          mkdir -p build/logs
+          {
+            echo "========================================"
+            echo "Build Summary"
+            echo "========================================"
+            echo "Repository : ${{ github.repository }}"
+            echo "Branch     : ${{ github.ref_name }}"
+            echo "Commit     : ${{ github.sha }}"
+            echo "Actor      : ${{ github.actor }}"
+            echo "Run ID     : ${{ github.run_id }}"
+            echo "Run Number : ${{ github.run_number }}"
+            echo "Event      : ${{ github.event_name }}"
+            echo "Date (UTC) : $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "Runner OS  : $(sw_vers -productVersion) ($(uname -m))"
+            echo "Xcode      : $(xcodebuild -version | tr '\n' ' ')"
+            echo "----------------------------------------"
+            if [ -f build/darksword-kexploit-fun.ipa ]; then
+              echo "IPA Size   : $(du -h build/darksword-kexploit-fun.ipa | cut -f1)"
+              echo "IPA SHA256 : $(shasum -a 256 build/darksword-kexploit-fun.ipa | cut -d' ' -f1)"
+            else
+              echo "IPA        : NOT BUILT"
+            fi
+            echo "========================================"
+          } | tee build/logs/build-summary.log
+
+          # Gộp tất cả log thành 1 file duy nhất
+          cat build/logs/build-summary.log \
+              build/logs/xcode-version.log \
+              build/logs/xpf-build.log \
+              build/logs/xcodebuild.log \
+              > build/darksword-kexploit-fun-build.log 2>/dev/null || true
+
+      - name: Upload Build Artifact (IPA)
         uses: actions/upload-artifact@v4
         with:
           name: darksword-kexploit-fun-ipa
           path: build/darksword-kexploit-fun.ipa
+          if-no-files-found: warn
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darksword-kexploit-fun-logs
+          path: build/logs/
+          if-no-files-found: warn
+
+      - name: Push IPA and log to repo root
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cp build/darksword-kexploit-fun.ipa ./darksword-kexploit-fun.ipa
+          cp build/darksword-kexploit-fun-build.log ./darksword-kexploit-fun-build.log
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add darksword-kexploit-fun.ipa darksword-kexploit-fun-build.log
+          git diff --staged --quiet || git commit -m "Update IPA and build log [skip ci]"
+          git push
