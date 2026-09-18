@@ -119,6 +119,74 @@ static pid_t esp_find_game_pid_kernel(const char *gameName) {
     return (pid_t)pid;
 }
 
+// FIX 2026-09-19 (LIVELOCK — lỗi thật trên máy user): luồng autoStart chạy
+// probe → kernel walk THẤY game (set lastWalk=T) → gọi esp_krw_init() NGAY
+// tại T+ε → init hỏi lại chính finder có throttle → dính cửa sổ throttle
+// 1s → trả -1 → esp_krw_init -3 "KHÔNG thấy tiến trình FreeFire" LẶP VÔ
+// HẠN dù game đang chạy (log user: hàng loạt cặp "kernel R/W sẵn sàng" +
+// "KHÔNG thấy tiến trình FreeFire" liên tiếp). Probe của monitor 2s cũng
+// dính throttle chéo của probe autoStart → gameProcessAlive nhấp nháy đỏ
+// → hàng "Game đang chạy" mất. Giờ:
+//   • Throttle window trả về CACHE tươi (<5s) thay vì -1 cứng đầu
+//   • Pipeline dùng esp_find_game_pid_now() — KHÔNG bao giờ bị throttle
+static pid_t g_findCachePid = -1;
+static struct timespec g_findCacheAt = {0, 0};
+static struct timespec g_lastKernelWalk = {0, 0};
+
+static long esp_ms_since(struct timespec then, struct timespec now) {
+    return (now.tv_sec - then.tv_sec) * 1000L
+         + (now.tv_nsec - then.tv_nsec) / 1000000L;
+}
+
+static void esp_find_cache_store(pid_t pid) {
+    g_findCachePid = pid;
+    clock_gettime(CLOCK_MONOTONIC, &g_findCacheAt);
+}
+
+// Finder cho PIPELINE (esp_krw_init): trả kết quả THỜI ĐIỂM HIỆN TẠI, không
+// bao giờ bị cửa sổ throttle đánh lừa thành "không thấy game". Dùng lại
+// cache nếu tươi <2s (tiết kiệm 1 walk khi probe vừa chạy ngay trước đó —
+// đúng kịch bản probe→init của autoStart), ngược lại sysctl → kernel walk.
+static pid_t esp_find_game_pid_now(const char *gameName) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (g_findCachePid != -1 && esp_ms_since(g_findCacheAt, now) < 2000)
+        return g_findCachePid;
+
+    pid_t pid = esp_find_game_pid_sysctl(gameName);
+    if (pid == -1) pid = esp_find_game_pid_kernel(gameName);
+    if (pid != -1) esp_find_cache_store(pid);
+    return pid;
+}
+
+// Finder cho PROBE định kỳ (monitor 2s / snapshot / alive-check): kernel
+// walk tối đa 1 lần/giây (PANIC-FIX giữ nguyên), nhưng trong cửa sổ throttle
+// trả CACHE tươi (<5s) thay vì -1 — hết cảnh "vừa thấy game lại báo mất".
+pid_t esp_krw_find_game_pid(const char *gameName) {
+    pid_t pid = esp_find_game_pid_sysctl(gameName);
+    if (pid != -1) {
+        esp_find_cache_store(pid);
+        return pid;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsedMs = esp_ms_since(g_lastKernelWalk, now);
+    if (elapsedMs < 1000) {
+        // Trong cửa sổ throttle: cache tươi (<5s) thì dùng — KHÔNG trả -1
+        // khi lần walk trước vừa thấy game (đây chính là livelock cũ).
+        if (g_findCachePid != -1 && esp_ms_since(g_findCacheAt, now) < 5000)
+            return g_findCachePid;
+        return -1;
+    }
+    g_lastKernelWalk = now;
+    pid = esp_find_game_pid_kernel(gameName);
+    // Cache cả -1: game thật sự vắng thì các probe trong 5s không phải
+    // walk lại; game xuất hiện thì walk kế tiếp (≥1s) sẽ thấy ngay.
+    esp_find_cache_store(pid);
+    return pid;
+}
+
 #pragma mark - Port transplant
 
 static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_t *outPort) {
@@ -273,7 +341,13 @@ int esp_krw_init(void) {
     // Step 3: find the game (HYBRID: sysctl trước — TrollStore logic, kernel
     // proc_find_by_name fallback — Task 18: sysctl-only bị sandbox chặn trên
     // iOS 18 nên trước đây pipeline không bao giờ thấy game)
-    pid_t pid = esp_krw_find_game_pid("FreeFire");
+    // FIX 2026-09-19 (LIVELOCK): DÙNG esp_find_game_pid_now — bản cũ gọi
+    // esp_krw_find_game_pid (có throttle 1s) trong khi probe của autoStart
+    // VỪA walk xong vài chục ms trước → init luôn dính throttle → -1 →
+    // -3 lặp vô hạn dù game đang chạy (log: "KHÔNG thấy tiến trình
+    // FreeFire" lặp liên tục). esp_find_game_pid_now không bao giờ bị
+    // throttle đánh lừa và tái dùng cache tươi <2s nên không tốn thêm walk.
+    pid_t pid = esp_find_game_pid_now("FreeFire");
     if (pid == -1) {
         ESPKRW_LOG("KHÔNG thấy tiến trình FreeFire — hãy mở game trước khi bật ESP");
         return -3;
@@ -400,12 +474,13 @@ uint64_t esp_krw_game_proc_kaddr(void) {
 
 bool esp_krw_game_alive(void) {
     if (g_espGamePid <= 0) return false;
-    // Kernel-side check: the proc must still be findable AND the pid must
-    // still match (pid reuse protection).
-    uint64_t proc = proc_find_by_name("FreeFire");
-    if (!proc) return false;
-    uint32_t pid = kread32(proc + off_proc_p_pid);
-    return pid == (uint32_t)g_espGamePid;
+    // FIX 2026-09-19 (livelock): dùng finder có throttle+cache — bản cũ
+    // proc_find_by_name TRỰC TIẾP nghĩa là MỖI lần esp_krw_ready() (monitor
+    // 2s + snapshot + heal gate + init fast-path) đều quét toàn bộ proc-list
+    // — đúng thứ throttle của finder muốn tránh. Ngữ nghĩa giữ nguyên: proc
+    // tìm thấy theo tên phải có pid trùng pid đã ghim (chống pid reuse).
+    pid_t pid = esp_krw_find_game_pid("FreeFire");
+    return pid != -1 && pid == (pid_t)g_espGamePid;
 }
 
 bool esp_krw_ready(void) {
@@ -424,24 +499,6 @@ bool esp_krw_game_process_exists_sysctl(void) {
     return esp_find_game_pid_sysctl("FreeFire") != -1;
 }
 
-// HYBRID probe — sysctl first (cheap; works on TrollStore-style unsandboxed
-// builds), kernel proc_find_by_name fallback (read-only, bounded walk — the
-// SAME lookup that has found SpringBoard pid=34 on this device). Task 18:
-// this is what makes the pipeline work on sandboxed iOS 18 where sysctl
-// KERN_PROC_ALL always fails.
-// PANIC-FIX: kernel walk có throttle 1 lần/giây (cùng pattern pid.mm) —
-// trên máy sandboxed, sysctl LUÔN fail nên không có throttle thì mỗi probe
-// 2s của ESPEngine đều quét kernel proc-list.
-pid_t esp_krw_find_game_pid(const char *gameName) {
-    pid_t pid = esp_find_game_pid_sysctl(gameName);
-    if (pid != -1) return pid;
-
-    static struct timespec lastKernelProbe = {0, 0};
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsedMs = (now.tv_sec - lastKernelProbe.tv_sec) * 1000L
-                   + (now.tv_nsec - lastKernelProbe.tv_nsec) / 1000000L;
-    if (elapsedMs < 1000) return -1;
-    lastKernelProbe = now;
-    return esp_find_game_pid_kernel(gameName);
-}
+// HYBRID probe (esp_krw_find_game_pid) + pipeline finder
+// (esp_find_game_pid_now): định nghĩa ở ĐẦU file, ngay sau
+// esp_find_game_pid_kernel — cần trước esp_krw_init (use-before-decl).
