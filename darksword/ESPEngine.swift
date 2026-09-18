@@ -241,7 +241,7 @@ final class ESPEngine: ObservableObject {
                 }
             }
 
-            var startRc = 0
+            var startRc: Int32 = 0
             if sessionFailure == nil {
                 startRc = esp_host_start(true)
                 DarkswordMechanism.releaseSessionForESP()
@@ -473,7 +473,7 @@ final class ESPEngine: ObservableObject {
             // FIX 2026-09-19: auto-revive — mọi nhánh kẹt .failed của luồng
             // ESP được monitor 2 s tự chạy lại (probe read-only; chỉ kick khi
             // kernel còn sống và không pipeline nào đang chạy).
-            if !self.autoStartPending, !self.busy, self.phase == .failed,
+            if !self.autoStartPending, !self.busy, case .failed = self.phase,
                Date() >= self.reviveNextAt,
                kexploit_krw_ready() || krw_persistence_is_recovered() {
                 self.reviveNextAt = Date().addingTimeInterval(Self.reviveCooldown)
