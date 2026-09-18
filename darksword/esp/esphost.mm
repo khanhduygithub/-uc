@@ -96,6 +96,11 @@ static atomic_bool g_gameRunning    = false;
 static atomic_uint g_contextID      = 0;
 static atomic_uint g_frameCount     = 0;
 static atomic_uint g_lastEnemyCount = 0;
+// FIX 2026-09-19: pid của SpringBoard TẠI THỜI ĐIỂM đăng ký thành công.
+// SpringBoard respring → pid mới → đăng ký cũ mất — so pid này với pid
+// session hiện tại để phát hiện và tự đăng ký lại (trước đây flag
+// sbRegistered kẹt true là không bao giờ đăng ký lại sau respring).
+static int32_t g_registeredSBPid    = 0;
 static UIInterfaceOrientation g_lastLandscapeOrient = UIInterfaceOrientationLandscapeRight;
 static BOOL g_orientationObserverOn = NO;
 static id     g_orientationObserverToken = nil;
@@ -296,8 +301,21 @@ int esp_host_register_in_springboard(void) {
     r_msg_main(inv, r_sel("invoke"), 0, 0, 0, 0);
 
     atomic_store(&g_sbRegistered, true);
-    ESPHOST_LOG("đăng ký SpringBoard HOÀN TẤT (context %u @ level %.0f)", contextID, level);
+    // FIX 2026-09-19: ghi lại pid SpringBoard lúc đăng ký — dùng làm mốc so
+    // sánh phát hiện respring (pid mới = đăng ký cũ đã chết).
+    g_registeredSBPid = (int32_t)remote_call_current_pid();
+    ESPHOST_LOG("đăng ký SpringBoard HOÀN TẤT (context %u @ level %.0f, SB pid=%d)", contextID, level, g_registeredSBPid);
     return 0;
+}
+
+bool esphost_sb_registration_stale(void) {
+    if (!atomic_load(&g_overlayWindow) || !atomic_load(&g_sbRegistered)) return false;
+    if (g_registeredSBPid == 0) return false;
+    // Chỉ kết luận được khi có session đang mở (pid != 0); không session =
+    // không xác định = KHÔNG stale (tránh kick đăng ký lại vô ích).
+    int32_t curSBPid = (int32_t)remote_call_current_pid();
+    if (curSBPid == 0) return false;
+    return curSBPid != g_registeredSBPid;
 }
 
 #pragma mark - Audio keep-alive
@@ -386,11 +404,20 @@ int esp_host_start(bool registerInSB) {
         // respring làm mất đăng ký). Thử đăng ký luôn thay vì returning 0
         // câm lặng — khi đó pipeline “thành công” mà overlay không bao giờ
         // đè lên game được. Caller phải đang GIỮ session khi registerInSB.
-        if (registerInSB && !atomic_load(&g_sbRegistered)) {
-            int reg = esp_host_register_in_springboard();
-            if (reg != 0) {
-                ESPHOST_LOG("đăng ký lại SpringBoard thất bại (%d) — window giữ nguyên, sẽ thử lại", reg);
-                return reg;
+        // FIX 2026-09-19: gồm cả trường hợp flag kẹt true nhưng pid SB đã
+        // đổi (respring) — đăng ký cũ chết, phải đăng ký lại.
+        if (registerInSB) {
+            int32_t curSBPid = (int32_t)remote_call_current_pid();
+            bool stale = atomic_load(&g_sbRegistered) && g_registeredSBPid != 0 &&
+                         curSBPid != 0 && curSBPid != g_registeredSBPid;
+            if (!atomic_load(&g_sbRegistered) || stale) {
+                if (stale)
+                    ESPHOST_LOG("SpringBoard đổi pid (%d -> %d) — đăng ký lại overlay…", g_registeredSBPid, curSBPid);
+                int reg = esp_host_register_in_springboard();
+                if (reg != 0) {
+                    ESPHOST_LOG("đăng ký lại SpringBoard thất bại (%d) — window giữ nguyên, sẽ thử lại", reg);
+                    return reg;
+                }
             }
         }
         ESPHOST_LOG("overlay đang chạy");
@@ -434,10 +461,22 @@ int esp_host_start(bool registerInSB) {
     esphost_start_orientation_observer();
 
     // 3. SpringBoard registration (caller must hold an open session)
+    // FIX 2026-09-19: đăng ký lại KHI CẦN — không chỉ khi flag chưa bật:
+    //   • flag chưa bật: lần đăng ký đầu (hoặc lần trước thất bại)
+    //   • flag bật nhưng pid SB đổi (respring): đăng ký cũ đã chết —
+    //     bản cũ bỏ qua vì flag kẹt true → overlay không bao giờ đè lại
+    //     lên game sau respring cho tới khi respring pipeline.
     if (registerInSB) {
-        int reg = esp_host_register_in_springboard();
-        if (reg != 0) {
-            ESPHOST_LOG("đăng ký SpringBoard thất bại (%d) — window vẫn tạo, có thể thử đăng ký lại", reg);
+        int32_t curSBPid = (int32_t)remote_call_current_pid();
+        bool stale = atomic_load(&g_sbRegistered) && g_registeredSBPid != 0 &&
+                     curSBPid != 0 && curSBPid != g_registeredSBPid;
+        if (!atomic_load(&g_sbRegistered) || stale) {
+            if (stale)
+                ESPHOST_LOG("SpringBoard đổi pid (%d -> %d) — đăng ký cũ đã chết, đăng ký lại…", g_registeredSBPid, curSBPid);
+            int reg = esp_host_register_in_springboard();
+            if (reg != 0) {
+                ESPHOST_LOG("đăng ký SpringBoard thất bại (%d) — window vẫn tạo, có thể thử đăng ký lại", reg);
+            }
         }
     }
 
@@ -464,6 +503,7 @@ void esp_host_stop(void) {
     atomic_store(&g_frameCount, 0);
     atomic_store(&g_lastEnemyCount, 0);
     atomic_store(&g_gameRunning, false);
+    g_registeredSBPid = 0;
     esp_krw_stop();
     ESPHOST_LOG("ESP overlay đã dừng");
 }

@@ -63,6 +63,12 @@ void esp_host_get_status(ESPHostStatus *out);
 // True while the overlay pipeline is running.
 bool esp_host_active(void);
 
+// FIX 2026-09-19: đăng ký SpringBoard đã CHẾT chưa? (SpringBoard respring
+// tạo pid mới làm mất đăng ký cũ trong khi flag sbRegistered vẫn kẹt true).
+// Chỉ phát hiện được khi một session RemoteCall đang MỞ (pid khác 0) — pid
+// hiện tại khác pid lúc đăng ký => true. An toàn gọi mọi lúc.
+bool esphost_sb_registration_stale(void);
+
 // Launches Free Fire from inside SpringBoard (SBSLaunchApplicationWithIdentifier
 // via remote dlsym, SBApplicationController fallback). Requires an OPEN
 // RemoteCall session. Returns 0 on success.

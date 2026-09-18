@@ -76,15 +76,27 @@ final class ESPEngine: ObservableObject {
     /// Auto-start bookkeeping (touched on `queue` / main thread).
     private var autoStartPending = false
     private var autoStartAttempts = 0
-    private var autoStartDeadline = Date.distantFuture
     /// Bumped on every autoStartAfterKernel(); in-flight attempt chains with
     /// an older generation exit silently (prevents double pipelines when the
     /// user presses Start Darksword again).
     private var autoStartGeneration = 0
-    /// How long auto-start keeps waiting for Free Fire before giving up.
-    /// 10 phút — user có thể bấm Start Darksword trước rồi mở game sau;
-    /// keep-alive audio giữ app sống suốt thời gian chờ nên chờ lâu không tốn gì.
-    private static let autoStartWaitLimit: TimeInterval = 600
+    /// FIX 2026-09-19 (5 hàng đỏ): ĐÃ BỎ deadline 600 s. Bản cũ cho pipeline
+    /// TỬ VỖNG sau 10 phút chờ game — user mở Free Fire muộn hơn là toàn bộ
+    /// cột đỏ vĩnh viễn, và finishStart(ok:false) còn giết luôn keep-alive
+    /// audio → app bị iOS suspend ngay khi user ở trong game → không gì tự
+    /// phục hồi được nữa. Chờ game là probe read-only (sysctl + kernel walk
+    /// throttle 1/s) nên chờ vô hạn là an toàn; phần CHẠM KERNEL (dựng
+    /// bridge/overlay) vẫn bounded theo epoch bên dưới.
+    /// Hết ngân sách autoStartMaxAttempts lần dựng bridge → nghỉ
+    /// autoStartEpochCooldown giây, nạp lại ngân sách, thử tiếp (pipeline
+    /// KHÔNG BAO GIỜ dead-end; kernel work vẫn có trần — panic safety).
+    private var autoStartEpochRetryAt = Date.distantPast
+    private static let autoStartMaxAttempts = 5
+    private static let autoStartEpochCooldown: TimeInterval = 120
+    /// Auto-revive khi phase kẹt ở .failed (mọi nhánh chết còn sót lại):
+    /// monitor 2 s probe read-only, đủ điều kiện thì chạy lại toàn luồng.
+    private var reviveNextAt = Date.distantPast
+    private static let reviveCooldown: TimeInterval = 30
 
     // MARK: SpringBoard re-registration recovery (auto, bounded)
     // Khi session fail lúc start (hoặc SpringBoard respring sau đó), overlay
@@ -97,10 +109,11 @@ final class ESPEngine: ObservableObject {
     private var sbNextRetryAt = Date.distantPast
     private static let sbRetryMax = 20
     private static let sbRetryCooldown: TimeInterval = 15
-    /// Bounded retries for kernel-bridge failures — never an infinite loop:
-    /// every retry touches the kernel, and a dead primitive must stay dead
-    /// (panic safety).
-    private static let autoStartMaxAttempts = 5
+    // Bounded retries for kernel-bridge failures — never an infinite loop:
+    // every retry touches the kernel, and a dead primitive must stay dead
+    // (panic safety). Ngân sách nằm ở autoStartMaxAttempts + epoch cooldown
+    // (đầu file) — pipeline tự nạp lại ngân sách sau mỗi kỳ nghỉ, không
+    // bao giờ dead-end nhưng kernel work luôn có trần.
 
     // MARK: - Auto start (one-button flow)
 
@@ -114,8 +127,8 @@ final class ESPEngine: ObservableObject {
         applyConfig()
         autoStartPending = true
         autoStartAttempts = 0
+        autoStartEpochRetryAt = Date.distantPast
         autoStartGeneration += 1
-        autoStartDeadline = Date().addingTimeInterval(Self.autoStartWaitLimit)
         busy = true
         phase = .starting
         log("esp: ===== TỰ ĐỘNG KHỞI CHẠY ESP (sau Start Darksword) =====")
@@ -124,6 +137,11 @@ final class ESPEngine: ObservableObject {
         // iOS phải không được suspend process — nếu không toàn bộ pipeline
         // (probe game, kernel bridge, session) đóng băng khi app vào nền.
         esphost_start_keepalive()
+        // FIX 2026-09-19: monitor 2 s chạy NGAY từ lúc bắt đầu (bản cũ chỉ
+        // start sau khi toàn luồng thành công) — status xanh/đỏ live trong
+        // lúc chờ game, auto re-register SpringBoard + auto-heal bridge và
+        // auto-revive nếu có nhánh nào kẹt .failed.
+        startRefresh()
         attemptAutoStart(delay: 1.0, generation: autoStartGeneration)
     }
 
@@ -133,15 +151,11 @@ final class ESPEngine: ObservableObject {
             // A newer Start Darksword run owns the pipeline now — step aside.
             guard self.autoStartPending, self.autoStartGeneration == generation else { return }
 
-            guard Date() < self.autoStartDeadline else {
-                self.autoStartPending = false
-                Task { @MainActor [weak self] in
-                    self?.finishStart(ok: false, message:
-                        "hết thời gian chờ Free Fire (\(Int(Self.autoStartWaitLimit))s) — mở game rồi bấm Start Darksword để chạy lại toàn bộ luồng")
-                }
-                return
-            }
-
+            // FIX 2026-09-19: KHÔNG còn deadline 600 s. Chờ game là probe
+            // read-only + throttle — chờ bao lâu cũng được (keep-alive audio
+            // giữ process sống khi user ở nền/game). Game xuất hiện muộn vẫn
+            // tự ghim, không còn trạng thái "đỏ vĩnh viễn".
+            //
             // Free Fire must exist BEFORE the kernel bridge is built so the
             // port transplant targets a stable process.
             // Task 18 FIX: probe CHỈ-sysctl bị kẹt vĩnh viễn trên iOS 18 —
@@ -161,10 +175,27 @@ final class ESPEngine: ObservableObject {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.phase = .starting
-                    self.lastMessage = "ESP sẵn sàng — đang chờ Free Fire khởi động…"
+                    self.lastMessage = "ESP sẵn sàng — đang chờ Free Fire khởi động… (mở game bất cứ lúc nào, ESP tự ghim)"
                 }
                 self.attemptAutoStart(delay: 2.0, generation: generation)
                 return
+            }
+
+            // Hết ngân sách dựng bridge → nghỉ một epoch rồi nạp lại ngân
+            // sách. Kernel work vẫn bounded (5 lần/epoch) — panic safety —
+            // nhưng pipeline SỐNG, không dead-end như bản cũ.
+            if self.autoStartAttempts >= Self.autoStartMaxAttempts {
+                guard Date() >= self.autoStartEpochRetryAt else {
+                    let remain = Int(self.autoStartEpochRetryAt.timeIntervalSinceNow.rounded(.up))
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.lastMessage = "dựng kernel bridge chưa xong — nghỉ \(max(remain, 1))s rồi tự thử lại…"
+                    }
+                    self.attemptAutoStart(delay: 2.0, generation: generation)
+                    return
+                }
+                self.autoStartAttempts = 0
+                log("esp: nạp lại ngân sách dựng bridge (epoch mới, \(Self.autoStartMaxAttempts) lần)")
             }
 
             let kr = esp_krw_init()
@@ -181,11 +212,15 @@ final class ESPEngine: ObservableObject {
                     self.attemptAutoStart(delay: 3.0, generation: generation)
                     return
                 }
-                self.autoStartPending = false
+                // Ngân sách hết → epoch cooldown, GIỮ pipeline sống.
+                self.autoStartEpochRetryAt = Date().addingTimeInterval(Self.autoStartEpochCooldown)
                 let message = self.describeKrwFailure(kr)
-                Task { @MainActor [weak self] in
-                    self?.finishStart(ok: false, message: message)
+                log("esp: \(message) — nghỉ \(Int(Self.autoStartEpochCooldown))s rồi tự thử lại (luồng không dừng)")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.lastMessage = "\(message) — sẽ tự thử lại sau \(Int(Self.autoStartEpochCooldown))s"
                 }
+                self.attemptAutoStart(delay: Self.autoStartEpochCooldown, generation: generation)
                 return
             }
 
@@ -206,26 +241,29 @@ final class ESPEngine: ObservableObject {
                 }
             }
 
+            var startRc = 0
             if sessionFailure == nil {
-                let rc = esp_host_start(true)
+                startRc = esp_host_start(true)
                 DarkswordMechanism.releaseSessionForESP()
-                guard rc == 0 else {
-                    self.autoStartPending = false
-                    Task { @MainActor [weak self] in
-                        self?.finishStart(ok: false, message: "esp_host_start thất bại (\(rc)) — xem log [ESPHOST]")
-                    }
-                    return
-                }
             } else {
                 log("esp: \(sessionFailure!) — vẫn chạy overlay nội bộ (bridge + cửa sổ + vẽ + keep-alive), tự thử đăng ký lại SpringBoard sau…")
-                let rc = esp_host_start(false)
-                guard rc == 0 else {
-                    self.autoStartPending = false
-                    Task { @MainActor [weak self] in
-                        self?.finishStart(ok: false, message: "esp_host_start(false) thất bại (\(rc)) — xem log [ESPHOST]")
-                    }
-                    return
+                startRc = esp_host_start(false)
+            }
+
+            guard startRc == 0 else {
+                // FIX 2026-09-19: esp_host_start fail KHÔNG còn kết liễu
+                // pipeline. Nếu rc là mã đăng ký-lại khi window đã sống thì
+                // overlay+tick vẫn đang chạy — coi như một epoch attempt và
+                // thử tiếp; keep-alive giữ nguyên mọi lúc.
+                self.autoStartAttempts += 1
+                log("esp: esp_host_start chưa xong (rc=\(startRc)) — lần \(self.autoStartAttempts)/\(Self.autoStartMaxAttempts), keep-alive vẫn bật")
+                if self.autoStartAttempts < Self.autoStartMaxAttempts {
+                    self.attemptAutoStart(delay: 3.0, generation: generation)
+                } else {
+                    self.autoStartEpochRetryAt = Date().addingTimeInterval(Self.autoStartEpochCooldown)
+                    self.attemptAutoStart(delay: Self.autoStartEpochCooldown, generation: generation)
                 }
+                return
             }
 
             self.autoStartPending = false
@@ -233,7 +271,7 @@ final class ESPEngine: ObservableObject {
                 if sessionFailure == nil {
                     self?.finishStart(ok: true, message: "ESP đang chạy — quay lại game, khung ESP sẽ đè lên màn hình")
                 } else {
-                    self?.finishStart(ok: true, message: "ESP chạy nửa cầu: kernel bridge + cửa sổ + vẽ OK, SpringBoard CHƯA đăng ký — sẽ tự thử lại; nếu vẫn đỏ sau vài phút hãy respring (tắt/mở lại màn hình không đủ — cần respring) rồi bấm Start Darksword")
+                    self?.finishStart(ok: true, message: "ESP chạy nửa cầu: kernel bridge + cửa sổ + vẽ OK, SpringBoard CHƯA đăng ký — tự thử lại mỗi 15 s; nếu vẫn đỏ sau vài phút hãy respring (tắt/mở lại màn hình không đủ — cần respring), mọi thứ còn lại tự phục hồi")
                 }
             }
         }
@@ -269,7 +307,11 @@ final class ESPEngine: ObservableObject {
                 self.startRefresh()
             } else {
                 self.phase = .failed(message)
-                esp_host_stop()
+                // FIX 2026-09-19: KHÔNG esp_host_stop() ở nhánh fail — bản cũ
+                // giết luôn keep-alive audio → app bị iOS suspend khi user
+                // đang ở trong game → mọi timer đóng băng → toàn bộ cột đỏ
+                // vĩnh viễn (đúng triệu chứng 5 đỏ / 4 xanh). Giữ keep-alive
+                // + overlay (nếu có); monitor 2 s vẫn chạy và tự hồi phục.
             }
             self.lastMessage = message
         }
@@ -355,6 +397,11 @@ final class ESPEngine: ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
 
+            // FIX 2026-09-19: khi pipeline tự khởi chạy đang giữ quyền điều
+            // khiển (autoStartPending) thì monitor KHÔNG đụng bridge/session
+            // — tránh 2 luồng cùng esp_krw_init/esp_host_start song song
+            // (race kernel transplant). Monitor chỉ cập nhật status.
+            //
             // Task 18: auto re-registration — overlay đang chạy nhưng chưa có
             // mặt trong SpringBoard (session fail lúc start, hoặc SpringBoard
             // respring làm mất đăng ký). Bounded + cooldown: SpringBoard còn
@@ -365,7 +412,12 @@ final class ESPEngine: ObservableObject {
             if stNow.sbRegistered && self.sbRetryAttempts > 0 {
                 self.sbRetryAttempts = 0   // mở lại ngân sách cho lần respring kế tiếp
             }
-            if stNow.overlayWindow, !stNow.sbRegistered,
+            // FIX: bắt cả trường hợp SpringBoard respring mà flag
+            // sbRegistered kẹt true — pid SB hiện tại (khi có session mở)
+            // khác pid lúc đăng ký => đăng ký đã chết, phải đăng ký lại.
+            let sbStale = stNow.overlayWindow && esphost_sb_registration_stale()
+            if stNow.overlayWindow, (!stNow.sbRegistered || sbStale),
+               !self.autoStartPending,
                !self.sbRetryInFlight,
                self.sbRetryAttempts < Self.sbRetryMax,
                Date() >= self.sbNextRetryAt {
@@ -396,12 +448,17 @@ final class ESPEngine: ObservableObject {
             // PANIC-FIX (audit 2026-09): cap 5 lần liên tiếp + nghỉ 60s —
             // chặn reinit-storm khi bridge cứ fail (mỗi lần = kernel walk +
             // transplant attempt).
-            if esp_host_active(), !esp_krw_ready(), esp_krw_game_process_exists() {
+            if !self.autoStartPending,
+               esp_host_active(), !esp_krw_ready(), esp_krw_game_process_exists() {
                 if Date() < self.healNextRetryAt {
                     // đang trong cooldown — bỏ qua nhịp này
                 } else if self.healAttempts >= Self.healMaxAttempts {
                     self.healNextRetryAt = Date().addingTimeInterval(Self.healCooldown)
                     log("esp: dựng lại bridge fail \(self.healAttempts) lần liên tiếp — nghỉ \(Int(Self.healCooldown))s rồi thử lại")
+                    // FIX 2026-09-19: bản cũ KHÔNG reset healAttempts ở đây →
+                    // kẹt vĩnh viễn + spam log mỗi 2 s. Nạp lại ngân sách sau
+                    // mỗi kỳ nghỉ — heal tiếp tục hoạt động vô thời hạn.
+                    self.healAttempts = 0
                 } else {
                     self.healAttempts += 1
                     log("esp: game mới phát hiện — dựng lại kernel bridge (lần \(self.healAttempts))…")
@@ -411,6 +468,23 @@ final class ESPEngine: ObservableObject {
                 }
             } else if esp_krw_ready() {
                 self.healAttempts = 0
+            }
+
+            // FIX 2026-09-19: auto-revive — mọi nhánh kẹt .failed của luồng
+            // ESP được monitor 2 s tự chạy lại (probe read-only; chỉ kick khi
+            // kernel còn sống và không pipeline nào đang chạy).
+            if !self.autoStartPending, !self.busy, self.phase == .failed,
+               Date() >= self.reviveNextAt,
+               kexploit_krw_ready() || krw_persistence_is_recovered() {
+                self.reviveNextAt = Date().addingTimeInterval(Self.reviveCooldown)
+                log("esp: tự hồi phục — chạy lại toàn bộ luồng ESP (pipeline trước đó kẹt fail)")
+                self.busy = true
+                self.phase = .starting
+                self.autoStartPending = true
+                self.autoStartAttempts = 0
+                self.autoStartEpochRetryAt = Date.distantPast
+                self.autoStartGeneration += 1
+                self.attemptAutoStart(delay: 0.5, generation: self.autoStartGeneration)
             }
 
             let snapshot = self.collectStatusSnapshot()
