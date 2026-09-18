@@ -67,6 +67,11 @@ final class ESPEngine: ObservableObject {
     private let queue = DispatchQueue(label: "com.darksword.esp", qos: .userInitiated)
     private var refreshTimer: DispatchSourceTimer?
     private var healAttempts = 0
+    // PANIC-FIX (audit 2026-09): giới hạn chu kỳ heal — bridge fail liên tục
+    // trước đây là 1 chu kỳ kernel-walk + transplant mỗi 2s không giới hạn.
+    private var healNextRetryAt = Date.distantPast
+    private static let healMaxAttempts = 5
+    private static let healCooldown: TimeInterval = 60
 
     /// Auto-start bookkeeping (touched on `queue` / main thread).
     private var autoStartPending = false
@@ -388,11 +393,21 @@ final class ESPEngine: ObservableObject {
             // Auto-heal: game restarted -> rebuild the transplanted port.
             // The overlay window/registration survives, only the kernel
             // bridge needs a rebuild.
+            // PANIC-FIX (audit 2026-09): cap 5 lần liên tiếp + nghỉ 60s —
+            // chặn reinit-storm khi bridge cứ fail (mỗi lần = kernel walk +
+            // transplant attempt).
             if esp_host_active(), !esp_krw_ready(), esp_krw_game_process_exists() {
-                self.healAttempts += 1
-                log("esp: game mới phát hiện — dựng lại kernel bridge (lần \(self.healAttempts))…")
-                if esp_krw_reinit() == 0 {
-                    esphost_on_game_relaunched()
+                if Date() < self.healNextRetryAt {
+                    // đang trong cooldown — bỏ qua nhịp này
+                } else if self.healAttempts >= Self.healMaxAttempts {
+                    self.healNextRetryAt = Date().addingTimeInterval(Self.healCooldown)
+                    log("esp: dựng lại bridge fail \(self.healAttempts) lần liên tiếp — nghỉ \(Int(Self.healCooldown))s rồi thử lại")
+                } else {
+                    self.healAttempts += 1
+                    log("esp: game mới phát hiện — dựng lại kernel bridge (lần \(self.healAttempts))…")
+                    if esp_krw_reinit() == 0 {
+                        esphost_on_game_relaunched()
+                    }
                 }
             } else if esp_krw_ready() {
                 self.healAttempts = 0

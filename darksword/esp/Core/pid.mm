@@ -239,21 +239,30 @@ task_t get_task_by_pid(pid_t pid)
     kr = processor_set_tasks(psDefault_control, &tasks, &numTasks);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "Error in processor_set_tasks: %x\n", kr);
+        mach_port_deallocate(mach_task_self(), psDefault_control);
+        mach_port_deallocate(mach_task_self(), self_host);
         return MACH_PORT_NULL;
     }
 
-    for (int i = 0; i < numTasks; i++)
-    {
+    // PANIC-FIX (audit 2026-09): bản cũ return tasks[i] ngay trong vòng lặp
+    // → rò rỉ TOÀN BỘ mảng task ports (mỗi port 1 send right) + mảng +
+    // pset control + host ref, MỖI LẦN GỌI. Giờ deallocate hết trừ port
+    // trả về cho caller.
+    task_t found = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < numTasks; i++) {
         int task_pid;
-        kr = pid_for_task(tasks[i], &task_pid);
-        if (kr != KERN_SUCCESS) {
+        kern_return_t pkr = pid_for_task(tasks[i], &task_pid);
+        if (pkr == KERN_SUCCESS && task_pid == pid && found == MACH_PORT_NULL) {
+            found = tasks[i];   // giữ +1 right cho caller
             continue;
         }
-
-        if (task_pid == pid) return tasks[i];
+        mach_port_deallocate(mach_task_self(), tasks[i]);
     }
-
-    return MACH_PORT_NULL;
+    vm_deallocate(mach_task_self(), (vm_address_t)tasks,
+                  (vm_size_t)(numTasks * sizeof(mach_port_t)));
+    mach_port_deallocate(mach_task_self(), psDefault_control);
+    mach_port_deallocate(mach_task_self(), self_host);
+    return found;
 }
 
 mach_vm_address_t get_image_base_address(mach_port_t task, const char *image_name)
@@ -282,8 +291,15 @@ mach_vm_address_t get_image_base_address(mach_port_t task, const char *image_nam
     vm_deallocate(mach_task_self(), read_mem, read_size);
 
     uint32_t image_count = infos.infoArrayCount;
+    // PANIC-FIX (audit 2026-09): infoArrayCount đọc từ process ngoài — nếu
+    // process đang chết dở/garbage thì count có thể là số khổng lồ →
+    // malloc/vm_read kích thước khủng. Clamp về mức thực tế (iOS app hiếm
+    // khi quá vài trăm image).
+    if (image_count == 0) return 0;
+    if (image_count > 8192) image_count = 8192;
     mach_vm_address_t info_array_addr = infos.infoArray;
-    vm_size_t image_info_size = image_count * sizeof(struct dyld_image_info64);
+    if (!info_array_addr) return 0;
+    vm_size_t image_info_size = (vm_size_t)image_count * sizeof(struct dyld_image_info64);
     struct dyld_image_info64 *image_infos = (struct dyld_image_info64 *)malloc(image_info_size);
     if (!image_infos) return 0;
 
@@ -309,6 +325,7 @@ mach_vm_address_t get_image_base_address(mach_port_t task, const char *image_nam
         {
             size_t to_copy = read_size > PATH_MAX ? PATH_MAX : read_size;
             memcpy(path_buffer, (void *)read_mem, to_copy);
+            path_buffer[PATH_MAX - 1] = '\0';   // PANIC-FIX: bảo đảm NUL trước strstr
             vm_deallocate(mach_task_self(), read_mem, read_size);
         }
 

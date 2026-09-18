@@ -38,6 +38,13 @@
 #import <string.h>
 #import <stdlib.h>
 #import <unistd.h>
+#import <time.h>
+#import <mach/mach.h>
+
+// XNU pid_for_task — dùng làm cổng verify sau transplant (chạy toàn bộ
+// đường convert_port_to_task của kernel, bắt port chết/garbage một cách
+// an toàn trước khi pipeline tin tưởng dùng port).
+extern kern_return_t pid_for_task(task_t task, int *pid);
 
 // XNU ipc_object.h — stable for a decade:
 #define ESP_IO_ACTIVE 0x80000000u
@@ -50,6 +57,22 @@ static uint64_t    g_espGameProcKaddr = 0;
 static uint64_t    g_espSelfTaskKaddr = 0;
 static uint64_t    g_espGamePortKaddr = 0;
 static bool        g_espRootTried     = false;
+
+// PANIC-FIX (audit 2026-09): port dùng LẠI qua các chu kỳ init/stop.
+// Trước đây mỗi esp_krw_init cấp phát port mới; heal-loop của ESPEngine
+// gọi reinit mỗi 2s khi bridge fail → rò rỉ 1 port + 2 right mỗi lần
+// (receive right không bao giờ được huỷ vì ta mất tên port). Giữ tên port
+// lại ở đây và transplant đè lên port cũ (đã được stop trả về IKOT_NONE)
+// → số port cố định = 1 dù heal bao nhiêu lần.
+static mach_port_t g_espReusablePort = MACH_PORT_NULL;
+
+static void esp_destroy_port_rights(mach_port_t port) {
+    if (port == MACH_PORT_NULL) return;
+    // Huỷ send right rồi receive right — port bị phá huỷ khi right cuối
+    // biến mất. Best-effort: lỗi bị bỏ qua (port có thể đã chết).
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, -1);
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+}
 
 #define ESPKRW_LOG(fmt, ...) printf("[ESPKRW] " fmt "\n", ##__VA_ARGS__)
 
@@ -99,29 +122,40 @@ static pid_t esp_find_game_pid_kernel(const char *gameName) {
 #pragma mark - Port transplant
 
 static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_t *outPort) {
-    if (!gameTaskKaddr || !g_espSelfTaskKaddr) return KERN_INVALID_ARGUMENT;
+    if (!gameTaskKaddr || !g_espSelfTaskKaddr || !is_kaddr_valid(gameTaskKaddr))
+        return KERN_INVALID_ARGUMENT;
 
     kern_return_t kr;
     mach_port_t port = MACH_PORT_NULL;
+    bool reused = false;
 
-    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
-    if (kr != KERN_SUCCESS) {
-        ESPKRW_LOG("mach_port_allocate thất bại: 0x%x (%s)", kr, mach_error_string(kr));
-        return kr;
+    // PANIC-FIX: tái sử dụng port đã park từ chu kỳ trước thay vì cấp phát
+    // mới (chặn rò rỉ port khi heal-loop chạy liên tục).
+    if (g_espReusablePort != MACH_PORT_NULL) {
+        port = g_espReusablePort;
+        g_espReusablePort = MACH_PORT_NULL;
+        reused = true;
+    } else {
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+        if (kr != KERN_SUCCESS) {
+            ESPKRW_LOG("mach_port_allocate thất bại: 0x%x (%s)", kr, mach_error_string(kr));
+            return kr;
+        }
+
+        kr = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+        if (kr != KERN_SUCCESS) {
+            ESPKRW_LOG("mach_port_insert_right thất bại: 0x%x (%s)", kr, mach_error_string(kr));
+            esp_destroy_port_rights(port);
+            return kr;
+        }
     }
 
-    kr = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) {
-        ESPKRW_LOG("mach_port_insert_right thất bại: 0x%x (%s)", kr, mach_error_string(kr));
-        mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
-        return kr;
-    }
-
-    // Locate the new port's ipc_port in kernel space.
+    // Locate the port's ipc_port in kernel space.
     uint64_t portKaddr = task_get_ipc_port_table_entry(g_espSelfTaskKaddr, port);
     if (!portKaddr) {
-        ESPKRW_LOG("không tìm được ipc_entry của port mới (task=0x%llx port=0x%x)",
-                   g_espSelfTaskKaddr, port);
+        ESPKRW_LOG("không tìm được ipc_entry của port (task=0x%llx port=0x%x reused=%d)",
+                   g_espSelfTaskKaddr, port, reused);
+        esp_destroy_port_rights(port);
         return KERN_FAILURE;
     }
 
@@ -130,6 +164,7 @@ static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_
     uint64_t selfTaskPortKaddr = task_get_ipc_port_table_entry(g_espSelfTaskKaddr, mach_task_self());
     if (!selfTaskPortKaddr) {
         ESPKRW_LOG("không tìm được ipc_entry của task port của chính mình");
+        esp_destroy_port_rights(port);
         return KERN_FAILURE;
     }
     uint32_t selfBits = kread32(selfTaskPortKaddr);
@@ -143,8 +178,24 @@ static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_
     uint64_t origKobject = kread64(portKaddr + off_ipc_port_ip_kobject);
 
     // Transplant: type -> IKOT_TASK, kobject -> game task.
+    // PANIC-FIX: verify read-back NGAY sau mỗi lần ghi (Task 20 pattern) —
+    // ghi hụt mà không biết là mồi mìn cho mọi Mach call sau này.
     kwrite32(portKaddr, newBits);
+    if (kread32(portKaddr) != newBits) {
+        ESPKRW_LOG("ghi io_bits không verify được — hoàn tác (bits=0x%08x kobject=0x%llx)",
+                   origBits, origKobject);
+        kwrite32(portKaddr, origBits);
+        esp_destroy_port_rights(port);
+        return KERN_FAILURE;
+    }
     kwrite64(portKaddr + off_ipc_port_ip_kobject, gameTaskKaddr);
+    if (kread64(portKaddr + off_ipc_port_ip_kobject) != gameTaskKaddr) {
+        ESPKRW_LOG("ghi ip_kobject không verify được — hoàn tác về IKOT_NONE an toàn");
+        kwrite32(portKaddr, ESP_IO_ACTIVE);
+        kwrite64(portKaddr + off_ipc_port_ip_kobject, 0);
+        esp_destroy_port_rights(port);
+        return KERN_FAILURE;
+    }
 
     // Verify through the same helper path the kernel will use later.
     uint64_t check = task_get_ipc_port_kobject(g_espSelfTaskKaddr, port);
@@ -153,13 +204,14 @@ static kern_return_t esp_transplant_task_port(uint64_t gameTaskKaddr, mach_port_
                    check, gameTaskKaddr, origBits, origKobject);
         kwrite32(portKaddr, origBits);
         kwrite64(portKaddr + off_ipc_port_ip_kobject, origKobject);
+        esp_destroy_port_rights(port);
         return KERN_FAILURE;
     }
 
     *outPort = port;
     g_espGamePortKaddr = portKaddr;
-    ESPKRW_LOG("transplant OK: port=0x%x port_kaddr=0x%llx game_task=0x%llx (io_bits=0x%08x)",
-               port, portKaddr, gameTaskKaddr, newBits);
+    ESPKRW_LOG("transplant OK: port=0x%x port_kaddr=0x%llx game_task=0x%llx (io_bits=0x%08x reused=%d)",
+               port, portKaddr, gameTaskKaddr, newBits, reused);
     return KERN_SUCCESS;
 }
 
@@ -237,11 +289,23 @@ int esp_krw_init(void) {
         return -4;
     }
     g_espGameProcKaddr = proc;
-    uint64_t task = proc_task(proc);
-    if (!task) {
-        ESPKRW_LOG("proc_task(proc=0x%llx) = 0", proc);
+
+    // PANIC-FIX (audit 2026-09): chặn race game-thoát-giữa-chừng trước khi
+    // ghi task kaddr vào port — 2 lần đọc task phải khớp nhau, pid phải
+    // còn đúng, kaddr phải nằm trong vùng kernel hợp lệ.
+    uint64_t task1 = proc_task(proc);
+    uint32_t pidRecheck = kread32(proc + off_proc_p_pid);
+    uint64_t task2 = proc_task(proc);
+    if (!task1 || task1 != task2 || !is_kaddr_valid(task1)) {
+        ESPKRW_LOG("proc_task(proc=0x%llx) không ổn định/invalid (t1=0x%llx t2=0x%llx)",
+                   proc, task1, task2);
         return -5;
     }
+    if (pidRecheck != (uint32_t)pid) {
+        ESPKRW_LOG("game vừa thoát trong lúc dựng bridge (pid %d -> %u) — thử lần sau", pid, pidRecheck);
+        return -4;
+    }
+    uint64_t task = task1;
     g_espGameTaskKaddr = task;
     ESPKRW_LOG("game proc=0x%llx task=0x%llx", proc, task);
 
@@ -252,6 +316,18 @@ int esp_krw_init(void) {
         (void)kr;
         return -6;
     }
+
+    // PANIC-FIX: cổng chức năng cuối — pid_for_task chạy đúng đường
+    // convert_port_to_task mà mọi Mach call sau này sẽ đi. Port chết /
+    // sai task bị bắt ở đây thay vì để pipeline dùng port rác.
+    int gatePid = -1;
+    if (pid_for_task(port, &gatePid) != KERN_SUCCESS || gatePid != pid) {
+        ESPKRW_LOG("pid_for_task qua port không khớp (got=%d expect=%d) — hoàn tác", gatePid, pid);
+        g_espGamePort = port;          // cho stop() biết port cần hoàn tác
+        esp_krw_stop();
+        return -7;
+    }
+
     g_espGamePort = port;
 
     ESPKRW_LOG("===== ESP kernel bridge HOÀN TẤT (pid=%d) =====", g_espGamePid);
@@ -265,12 +341,39 @@ int esp_krw_reinit(void) {
 
 void esp_krw_stop(void) {
     if (g_espGamePortKaddr) {
-        // Restore to a plain active receive port; drop the claimed task
-        // reference so nothing (including process exit) can underflow it.
-        kwrite32(g_espGamePortKaddr, ESP_IO_ACTIVE);   // IO_ACTIVE | IKOT_NONE
-        kwrite64(g_espGamePortKaddr + off_ipc_port_ip_kobject, 0);
-        ESPKRW_LOG("port 0x%x đã hoàn tác về IKOT_NONE (không deallocate — tránh rò rỉ ref task)",
-                   g_espGamePort);
+        // PANIC-FIX (Task 20 pattern — verify read-back): KHÔNG ghi mù vào
+        // kernel. Đọc trạng thái hiện tại trước:
+        //   • kobject đã 0 và bits đã là plain port → đã restored, bỏ qua.
+        //   • kobject KHÁC với task ta đã ghi → kernel state đã đổi, KHÔNG
+        //     đụng vào (ghi mù vào entry lạ = kernel panic).
+        uint32_t curBits  = kread32(g_espGamePortKaddr);
+        uint64_t curKobj  = kread64(g_espGamePortKaddr + off_ipc_port_ip_kobject);
+        if (curKobj == 0 && curBits != 0 && !(curBits & ~ESP_IO_ACTIVE)) {
+            ESPKRW_LOG("port 0x%x đã ở trạng thái restored — bỏ qua ghi", g_espGamePort);
+        } else if (curKobj != g_espGameTaskKaddr) {
+            ESPKRW_LOG("port kaddr 0x%llx KHÔNG còn do ta kiểm soát (kobj=0x%llx task=0x%llx) — không ghi mù",
+                       g_espGamePortKaddr, curKobj, g_espGameTaskKaddr);
+        } else {
+            // Restore to a plain active receive port; drop the claimed task
+            // reference so nothing (including process exit) can underflow it.
+            kwrite32(g_espGamePortKaddr, ESP_IO_ACTIVE);   // IO_ACTIVE | IKOT_NONE
+            kwrite64(g_espGamePortKaddr + off_ipc_port_ip_kobject, 0);
+            uint32_t vb = kread32(g_espGamePortKaddr);
+            uint64_t vk = kread64(g_espGamePortKaddr + off_ipc_port_ip_kobject);
+            if (vb != ESP_IO_ACTIVE || vk != 0)
+                ESPKRW_LOG("CẢNH BÁO: restore không verify được (bits=0x%08x kobj=0x%llx)", vb, vk);
+            else
+                ESPKRW_LOG("port 0x%x đã hoàn tác về IKOT_NONE (verify OK)", g_espGamePort);
+        }
+    }
+    // PANIC-FIX (leak): park port để chu kỳ init kế tiếp tái sử dụng thay
+    // vì cấp phát mới. Nếu đã có port parked thì phá huỷ port thừa.
+    if (g_espGamePort != MACH_PORT_NULL) {
+        if (g_espReusablePort == MACH_PORT_NULL) {
+            g_espReusablePort = g_espGamePort;
+        } else {
+            esp_destroy_port_rights(g_espGamePort);
+        }
     }
     g_espGamePort = MACH_PORT_NULL;
     g_espGamePortKaddr = 0;
@@ -326,8 +429,19 @@ bool esp_krw_game_process_exists_sysctl(void) {
 // SAME lookup that has found SpringBoard pid=34 on this device). Task 18:
 // this is what makes the pipeline work on sandboxed iOS 18 where sysctl
 // KERN_PROC_ALL always fails.
+// PANIC-FIX: kernel walk có throttle 1 lần/giây (cùng pattern pid.mm) —
+// trên máy sandboxed, sysctl LUÔN fail nên không có throttle thì mỗi probe
+// 2s của ESPEngine đều quét kernel proc-list.
 pid_t esp_krw_find_game_pid(const char *gameName) {
     pid_t pid = esp_find_game_pid_sysctl(gameName);
-    if (pid == -1) pid = esp_find_game_pid_kernel(gameName);
-    return pid;
+    if (pid != -1) return pid;
+
+    static struct timespec lastKernelProbe = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsedMs = (now.tv_sec - lastKernelProbe.tv_sec) * 1000L
+                   + (now.tv_nsec - lastKernelProbe.tv_nsec) / 1000000L;
+    if (elapsedMs < 1000) return -1;
+    lastKernelProbe = now;
+    return esp_find_game_pid_kernel(gameName);
 }
