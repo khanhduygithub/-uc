@@ -492,6 +492,18 @@ final class ESPEngine: ObservableObject {
             ESPPrefsSetFloat("AimPos", Float(c.aimPosition.rawValue))
             ESPPrefsSetFloat("AimTargetMode", Float(c.aimTargetMode.rawValue))
 
+            // ─── Mod engine (CrackTeam parity) — key = side esp.mm đọc ───
+            ESPPrefsSetBool("ShootNoReload", c.shootNoReload)
+            ESPPrefsSetBool("NoAmmoConsume", c.noAmmoConsume)
+            ESPPrefsSetBool("FireRateBoost", c.fireRateBoost)
+            ESPPrefsSetBool("NoRecoil", c.noRecoil)
+            ESPPrefsSetBool("FastReload", c.fastReload)
+            ESPPrefsSetBool("FastRun", c.fastRun)
+            ESPPrefsSetBool("FastFalling", c.fastFalling)
+            ESPPrefsSetBool("WeaponMoveSpeed", c.weaponMoveSpeed)
+            ESPPrefsSetBool("InfiniteHealer", c.infiniteHealer)
+            ESPPrefsSetBool("NoForceSync", c.noForceSync)
+
             ESPPrefsSetBool("camcao", c.highCamera)
             ESPPrefsSetFloat("Campc", Float(c.highCameraValue))
 
@@ -528,6 +540,21 @@ struct ESPConfig: Equatable {
     var triggerMode: TriggerMode = .always
     var aimPosition: AimPosition = .head
     var aimTargetMode: TargetMode = .fovDistance
+
+    // Weapon mods (CrackTeam parity — same feature set, kernel-RW technique)
+    var shootNoReload = false      // bắn không cần nạp đạn
+    var noAmmoConsume = false      // vô hạn đạn (không trừ đạn khi bắn)
+    var fireRateBoost = false      // tốc độ bắn x5 (fire interval 1.0 → 0.2)
+    var noRecoil = false           // triệt tiêu giật (cần offset recoil — tự tắt
+                                   //  nếu offset.h chưa có giá trị cho OB này)
+    var fastReload = false         // nạp đạn nhanh (reload scale 1.0 → 0.5)
+
+    // Player mods (CrackTeam parity)
+    var fastRun = false            // chạy nhanh (run speed scale → 2.0)
+    var fastFalling = false        // rơi nhanh (falling speed scale → 1.5)
+    var weaponMoveSpeed = false    // di chuyển nhanh khi cầm súng (→ 1.5)
+    var infiniteHealer = false     // hồi máu vô hạn
+    var noForceSync = false        // bỏ qua force-sync của server
 
     // Camera
     var highCamera = false

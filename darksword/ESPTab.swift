@@ -16,6 +16,8 @@ struct ESPTab: View {
                 statusCard
                 controlCard
                 displaySection
+                weaponModsSection
+                playerModsSection
                 aimbotSection
                 cameraSection
             }
@@ -154,6 +156,34 @@ struct ESPTab: View {
             toggle("Đếm địch trên màn hình", $esp.config.enemyCount)
             toggle("Vẽ cả bot", $esp.config.showBots)
             toggle("Vòng FOV aimbot", $esp.config.showFov)
+        }
+    }
+
+    // MARK: Weapon mods (CrackTeam parity)
+
+    private var weaponModsSection: some View {
+        section("Mods vũ khí") {
+            toggle("Bắn không cần nạp đạn", $esp.config.shootNoReload)
+            toggle("Vô hạn đạn (không trừ đạn)", $esp.config.noAmmoConsume)
+            toggle("Tốc độ bắn x5", $esp.config.fireRateBoost)
+            toggle("Triệt tiêu giật (no recoil)", $esp.config.noRecoil)
+            toggle("Nạp đạn nhanh", $esp.config.fastReload)
+        }
+    }
+
+    // MARK: Player mods (CrackTeam parity)
+
+    private var playerModsSection: some View {
+        section("Mods nhân vật") {
+            toggle("Chạy nhanh", $esp.config.fastRun)
+            toggle("Rơi nhanh", $esp.config.fastFalling)
+            toggle("Di chuyển nhanh khi cầm súng", $esp.config.weaponMoveSpeed)
+            toggle("Hồi máu vô hạn", $esp.config.infiniteHealer)
+            toggle("Bỏ qua force-sync (no force sync)", $esp.config.noForceSync)
+
+            Text("Mods ghi trực tiếp vào bộ nhớ game qua kernel bridge của DarkSword (không phải TrollStore). Có hiệu lực khi đang trong trận; rời trận tự khôi phục trạng thái game.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 

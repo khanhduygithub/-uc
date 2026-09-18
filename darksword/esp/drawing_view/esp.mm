@@ -24,24 +24,42 @@ bool isDis      = YES;
 bool isLine     = YES;
 bool isEspBot   = NO;
 bool isWeapon   = NO;
-bool BackJump = NO;
 bool isBone = NO;
-bool Norecoil = NO;
-bool camcao = NO;
-bool hoihp = NO;
-bool danthg = NO;
-bool testGhost = NO;
-bool dunhanh = NO;
+bool camcao = NO;     // camera cao — dùng trong render loop, giữ lại
 
-// ========== THÊM MỚI: 3 chức năng Memory ==========
-bool isNoReload    = NO;
-bool isVohaDan     = NO;
-bool isFastFire    = NO;
-// ==================================================
-
-// ========== THÊM MỚI: Show FOV ==========
+// ========== Mod engine (CrackTeam parity) ==========
+// Wanted = user config (ESPPrefs). Applied = trạng thái đã ghi vào game,
+// để tắt mod khôi phục đúng giá trị mặc định một lần duy nhất.
 bool isShowFov = YES;
-// ========================================
+static bool s_wantShootNoReload   = NO;
+static bool s_wantNoAmmoConsume   = NO;
+static bool s_wantFireRateBoost   = NO;
+static bool s_wantNoRecoil        = NO;
+static bool s_wantFastReload      = NO;
+static bool s_wantFastRun         = NO;
+static bool s_wantFastFalling     = NO;
+static bool s_wantWeaponMoveSpeed = NO;
+static bool s_wantInfiniteHealer  = NO;
+static bool s_wantNoForceSync     = NO;
+
+static bool s_apShootNoReload   = false;
+static bool s_apNoAmmoConsume   = false;
+static bool s_apFireRateBoost   = false;
+static bool s_apNoRecoil        = false;
+static bool s_apFastReload      = false;
+static bool s_apFastRun         = false;
+static bool s_apFastFalling     = false;
+static bool s_apWeaponMoveSpeed = false;
+static bool s_apInfiniteHealer  = false;
+static bool s_apNoForceSync     = false;
+static uint64_t s_lastNoRecoilWeapon = 0;   // đổi súng → apply lại recoil context
+// ===================================================
+
+// ========== THÊM MỚI: 3 chức năng Memory (nay nằm trong mod engine) ==========
+bool isNoReload    = NO;   // = ShootNoReload — giữ tên cũ cho tương thích
+bool isVohaDan     = NO;   // = NoAmmoConsume
+bool isFastFire    = NO;   // = FireRateBoost
+// ==================================================
 
 // ─── Aimbot Flags 
 //─────────────────────────────
@@ -76,36 +94,41 @@ void ESPSyncFromPrefs(void) {
     isName   = ESPPrefsBool(NSSENCRYPT("Name"),   NO);
     isDis      = ESPPrefsBool(NSSENCRYPT("Dis"),   NO);
 
-    dunhanh = ESPPrefsBool(NSSENCRYPT("dunhanh"), NO);
-
-   
-    testGhost = ESPPrefsBool(NSSENCRYPT("testGhost"),    NO);
-
-
-    camcao = ESPPrefsBool(NSSENCRYPT("camcao"),    NO);
-   
-    hoihp = ESPPrefsBool(NSSENCRYPT("hoihp"),    NO);
-
-    danthg = ESPPrefsBool(NSSENCRYPT("danthg"),    NO);
-
-
-    Norecoil    = ESPPrefsBool(NSSENCRYPT("Norecoil"),    NO);
     isBone   =  ESPPrefsBool(NSSENCRYPT("Bone"),   NO);
     isLine   = ESPPrefsBool(NSSENCRYPT("Line"),   NO);
     isEspBot = ESPPrefsBool(NSSENCRYPT("EspBot"), NO);
-    BackJump = ESPPrefsBool(NSSENCRYPT("BackJump"), NO);
+
+    camcao = ESPPrefsBool(NSSENCRYPT("camcao"),    NO);
+
+
+    // ========== Mod engine — CrackTeam parity keys ==========
+    s_wantShootNoReload   = ESPPrefsBool(NSSENCRYPT("ShootNoReload"), NO);
+    s_wantNoAmmoConsume   = ESPPrefsBool(NSSENCRYPT("NoAmmoConsume"), NO);
+    s_wantFireRateBoost   = ESPPrefsBool(NSSENCRYPT("FireRateBoost"), NO);
+    s_wantNoRecoil        = ESPPrefsBool(NSSENCRYPT("NoRecoil"),      NO);
+    s_wantFastReload      = ESPPrefsBool(NSSENCRYPT("FastReload"),    NO);
+    s_wantFastRun         = ESPPrefsBool(NSSENCRYPT("FastRun"),       NO);
+    s_wantFastFalling     = ESPPrefsBool(NSSENCRYPT("FastFalling"),   NO);
+    s_wantWeaponMoveSpeed = ESPPrefsBool(NSSENCRYPT("WeaponMoveSpeed"), NO);
+    s_wantInfiniteHealer  = ESPPrefsBool(NSSENCRYPT("InfiniteHealer"), NO);
+    s_wantNoForceSync     = ESPPrefsBool(NSSENCRYPT("NoForceSync"),   NO);
+    // Tương thích ngược với key cũ của bản HUD trước khi remake
+    s_wantShootNoReload   = s_wantShootNoReload || ESPPrefsBool(NSSENCRYPT("NoReload"),  NO);
+    s_wantNoAmmoConsume   = s_wantNoAmmoConsume || ESPPrefsBool(NSSENCRYPT("VohaDan"),   NO);
+    s_wantFireRateBoost   = s_wantFireRateBoost || ESPPrefsBool(NSSENCRYPT("FastFire"),  NO);
+    s_wantNoRecoil        = s_wantNoRecoil      || ESPPrefsBool(NSSENCRYPT("Norecoil"),  NO);
+    s_wantFastRun         = s_wantFastRun       || ESPPrefsBool(NSSENCRYPT("dunhanh"),   NO);
+    s_wantInfiniteHealer  = s_wantInfiniteHealer || ESPPrefsBool(NSSENCRYPT("hoihp"),    NO);
+    isNoReload = s_wantShootNoReload;
+    isVohaDan  = s_wantNoAmmoConsume;
+    isFastFire = s_wantFireRateBoost;
+    // ========================================================
     isAimIgnoreBot    = ESPPrefsBool(NSSENCRYPT("AimIgnoreBot"),    NO);
     isAimIgnoreKnock  = ESPPrefsBool(NSSENCRYPT("AimIgnoreKnock"), NO);
     isAimCheckVisible = ESPPrefsBool(NSSENCRYPT("AimCheckVisible"), NO);
     isAimRage         = ESPPrefsBool(NSSENCRYPT("AimRage"),         NO);
     isLineAim         = ESPPrefsBool(NSSENCRYPT("LineAim"),         YES);
     isAimbot          = ESPPrefsBool(NSSENCRYPT("Aimbot"),          NO);
-
-    // ========== THÊM MỚI: Load 3 chức năng Memory ==========
-    isNoReload = ESPPrefsBool(NSSENCRYPT("NoReload"), NO);
-    isVohaDan  = ESPPrefsBool(NSSENCRYPT("VohaDan"), NO);
-    isFastFire = ESPPrefsBool(NSSENCRYPT("FastFire"), NO);
-    // ========================================================
 
     // ========== THÊM MỚI ==========
     isShowFov = ESPPrefsBool(NSSENCRYPT("ShowFov"), YES);
@@ -726,6 +749,123 @@ void set_aim(uint64_t player, Quaternion rotation, float targetDist) {
 bool get_IsFiring(uint64_t p)   { return isVaildPtr(p) && GetDataUInt16(p, 21) == 2; }
 bool get_IsScoping(uint64_t p)  { return isVaildPtr(p) && GetDataUInt16(p, 12) != 0; }
 
+// ─── Mod engine (CrackTeam parity) ────────────
+// Port đúng pattern ApplyFlork* của FreeFire-DS.ipa:
+//   • Bật:  ĐỌC giá trị hiện tại trước — chỉ GHI khi chưa đúng target
+//           (tránh ghi lặp 60Hz vào game, giảm tải mach_vm_write).
+//   • Tắt:  ghi lại giá trị mặc định của game ĐÚNG MỘT LẦN rồi xóa cờ.
+//   • Offset = 0 → mod bị bỏ qua hoàn toàn (không ghi gì) — an toàn khi
+//     chưa có offset cho phiên bản game mới.
+// Tất cả đều là ghi vào process game qua port đã transplant (mach_vm_write)
+// — không có kernel write nào ở đường này, không rủi ro panic kernel.
+
+static inline bool ModBoolEnabled(uint64_t base, uint64_t off, bool want, bool *applied,
+                                  bool target, bool def) {
+    if (!off) { *applied = false; return false; }          // chưa có offset → skip
+    if (!isVaildPtr((uintptr_t)base)) return false;
+    long addr = (long)(base + off);
+    if (want) {
+        bool cur = def;
+        if (!_read(addr, &cur, sizeof(cur)) || cur != target)
+            WriteAddr<bool>(addr, target);
+        *applied = true;
+        return true;
+    }
+    if (*applied) {
+        WriteAddr<bool>(addr, def);
+        *applied = false;
+    }
+    return false;
+}
+
+static inline bool ModFloatEnabled(uint64_t base, uint64_t off, bool want, bool *applied,
+                                   float target, float def) {
+    if (!off) { *applied = false; return false; }
+    if (!isVaildPtr((uintptr_t)base)) return false;
+    long addr = (long)(base + off);
+    if (want) {
+        float cur = def;
+        if (!_read(addr, &cur, sizeof(cur)) || cur != target)
+            WriteAddr<float>(addr, target);
+        *applied = true;
+        return true;
+    }
+    if (*applied) {
+        WriteAddr<float>(addr, def);
+        *applied = false;
+    }
+    return false;
+}
+
+// Áp toàn bộ mod cho local player — gọi mỗi frame sau khi myPawn đã validate.
+void ESPApplyMods(uint64_t myPawn) {
+    if (!isVaildPtr((uintptr_t)myPawn)) return;
+
+    uint64_t playerAttributes = ReadAddr<uint64_t>(myPawn + kPlayerAttributes);
+    uint64_t weaponHand       = WeaponOnHand(myPawn);
+
+    // ── Weapon mods ──
+    // Vô hạn đạn: weapon->costAmmo = false (mặc định game = true)
+    ModBoolEnabled(weaponHand, kWeaponCostAmmo, s_wantNoAmmoConsume,
+                   &s_apNoAmmoConsume, false, true);
+    // Bắn không cần nạp: attributes->shootNoReload = true (mặc định = false)
+    ModBoolEnabled(playerAttributes, kShootNoReload, s_wantShootNoReload,
+                   &s_apShootNoReload, true, false);
+    // Tốc độ bắn x5: attributes->fireInterval = 0.2 (mặc định game = 1.0)
+    ModFloatEnabled(playerAttributes, kFastFireOff, s_wantFireRateBoost,
+                    &s_apFireRateBoost, 0.2f, 1.0f);
+
+    // No recoil: weapon->recoilContext->value = 0 (mặc định = 1.0).
+    // Đổi súng → context mới → apply lại từ đầu (pattern g_lastNoRecoilWeapon
+    // của Cofi). Offset = 0 → tự bỏ qua.
+    if (kWeaponRecoilContext && kRecoilContextValue) {
+        if (weaponHand != s_lastNoRecoilWeapon) {
+            s_lastNoRecoilWeapon = weaponHand;
+            s_apNoRecoil = false;   // context mới cần apply lại
+        }
+        if (isVaildPtr((uintptr_t)weaponHand)) {
+            uint64_t recoilCtx = ReadAddr<uint64_t>(weaponHand + kWeaponRecoilContext);
+            ModFloatEnabled(recoilCtx, kRecoilContextValue, s_wantNoRecoil,
+                            &s_apNoRecoil, 0.0f, 1.0f);
+        }
+    } else {
+        s_apNoRecoil = false;
+    }
+
+    // Fast reload: attributes->reloadScale = 0.5 (mặc định 1.0)
+    ModFloatEnabled(playerAttributes, kAttrFastReload, s_wantFastReload,
+                    &s_apFastReload, 0.5f, 1.0f);
+    // Chạy nhanh: attributes->runSpeedScale = 2.0 (mặc định 1.0) — đúng giá
+    // trị 2.0f mà Cofi ghi (disasm 0x40200000)
+    ModFloatEnabled(playerAttributes, kAttrRunSpeedScale, s_wantFastRun,
+                    &s_apFastRun, 2.0f, 1.0f);
+    // Rơi nhanh: attributes->fallingSpeedScale = 1.5 (mặc định 1.0) — đúng
+    // giá trị 1.5f của Cofi (disasm 0x3fc00000)
+    ModFloatEnabled(playerAttributes, kAttrFallingSpeedScale, s_wantFastFalling,
+                    &s_apFastFalling, 1.5f, 1.0f);
+    // Di chuyển khi cầm súng: attributes->weaponMoveSpeed = 1.5 (mặc định 1.0)
+    ModFloatEnabled(playerAttributes, kAttrWeaponMoveSpeed, s_wantWeaponMoveSpeed,
+                    &s_apWeaponMoveSpeed, 1.5f, 1.0f);
+    // Hồi máu vô hạn: attributes->infiniteHealer = true (mặc định false)
+    ModBoolEnabled(playerAttributes, kAttrInfiniteHealer, s_wantInfiniteHealer,
+                   &s_apInfiniteHealer, true, false);
+    // No force sync: player->waitForForceSync = true (mặc định false)
+    ModBoolEnabled(myPawn, kPlayerWaitForForceSync, s_wantNoForceSync,
+                   &s_apNoForceSync, true, false);
+}
+
+// Reset trạng thái applied (khi chết / rời match / game thoát). WANT flags
+// (config người dùng) được GIỮ NGUYÊN — vào match mới mod tự apply lại vì
+// applied=false → ghi target ngay frame đầu. Không cần ghi restore ở đây:
+// game tự reset attributes khi vào trận mới, ghi restore vào pawn chết chỉ
+// là rác mach_vm_write.
+void ESPResetModState(void) {
+    s_apShootNoReload = s_apNoAmmoConsume = s_apFireRateBoost = false;
+    s_apNoRecoil = s_apFastReload = s_apFastRun = s_apFastFalling = false;
+    s_apWeaponMoveSpeed = s_apInfiniteHealer = s_apNoForceSync = false;
+    s_lastNoRecoilWeapon = 0;
+}
+
 // ─── Main ESP Render ──────────────────────────
 - (ESPFrameStats)renderESPWithBuffers:(ESPGeometryBuffers *)buffers
                             viewWidth:(CGFloat)vw viewHeight:(CGFloat)vh
@@ -745,16 +885,17 @@ bool get_IsScoping(uint64_t p)  { return isVaildPtr(p) && GetDataUInt16(p, 12) !
     }
     if (!isVaildPtr(cachedCamera) || !isVaildPtr(cachedMatch)) return stats;
 
-if(BackJump) {
-
-//BackJUMP(cachedMatchGame);
-
-}
-
     uint64_t myPawn = getLocalPlayer(cachedMatch);
-    if (!isVaildPtr(myPawn) || get_CurHP(myPawn) <= 0) return stats;
+    if (!isVaildPtr(myPawn) || get_CurHP(myPawn) <= 0) {
+        // rời match / chết: chỉ reset applied-state, giữ config người dùng
+        ESPResetModState();
+        return stats;
+    }
 
     stats.inMatch = true;
+
+    // ─── Mod engine (CrackTeam parity): áp toàn bộ mod người chơi/vũ khí ───
+    ESPApplyMods(myPawn);
 
         if (camcao) { 
         uint64_t FollowCameraObj = ReadAddr<uint64_t>(myPawn + kFollowCamera);
@@ -773,28 +914,9 @@ if(BackJump) {
     }
 
 
-    // ========== THÊM MỚI: 3 chức năng Memory (NoReload, VohaDan, FastFire) ==========
-    /*
-    uint64_t playerAttributes = ReadAddr<uint64_t>(myPawn + kPlayerAttributes);
-    if (isVaildPtr(playerAttributes)) {
-        WriteAddr<bool>(playerAttributes + kShootNoReload, isNoReload);
-}
-        
-        // Fast Fire Toggle
-        
-        if (isFastFire) {
-            WriteAddr<float>(playerAttributes + 0x270, 0.2f);
-        } else {
-            WriteAddr<float>(playerAttributes + 0x270, 1.0f);
-        }
-    }
-    
-    uint64_t weaponHand = WeaponOnHand(myPawn);
-    if (isVaildPtr(weaponHand)) {
-        WriteAddr<bool>(weaponHand + kWeaponCostAmmo, !isVohaDan);
-    }
-    */    
-    // =================================================================================
+    // ========== Mod engine: NoReload / NoAmmoConsume / FireRateBoost + các
+    // attr mods được áp trong ESPApplyMods(myPawn) ở đầu hàm — khối ghi cũ
+    // bị comment lỗi brace đã được thay bằng mod engine applied-state. ==========
 
     uint64_t camTransform = ReadAddr<uint64_t>(myPawn + kMainCameraTransform);
     if (!isVaildPtr(camTransform)) return stats;

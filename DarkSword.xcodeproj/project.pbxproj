@@ -41,6 +41,9 @@
                                 DA0000000000000000000420 /* espkrw.m in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000401; };
                                 DA0000000000000000000421 /* esphost.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000403; };
                                 DA0000000000000000000422 /* pid.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000406; };
+                                DA0000000000000000000460 /* TSEventFetcher.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000451; };
+                                DA0000000000000000000461 /* UITouch-KIFAdditions.m in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000453; };
+                                DA0000000000000000000462 /* IOHIDEvent+KIF.m in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000455; };
                                 DA0000000000000000000423 /* GameLogic.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000408; };
                                 DA0000000000000000000424 /* UnityMath.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA000000000000000000040A; };
                                 DA0000000000000000000425 /* esp.mm in Sources */ = {isa = PBXBuildFile; fileRef = DA0000000000000000000412; };
@@ -120,6 +123,19 @@
                                 DA0000000000000000000402 /* esphost.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = esphost.h; sourceTree = "<group>"; };
                                 DA0000000000000000000403 /* esphost.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = esphost.mm; sourceTree = "<group>"; };
                                 DA0000000000000000000404 /* mahoa.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = mahoa.h; sourceTree = "<group>"; };
+                                DA0000000000000000000450 /* TSEventFetcher.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = TSEventFetcher.h; sourceTree = "<group>"; };
+                                DA0000000000000000000451 /* TSEventFetcher.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = TSEventFetcher.mm; sourceTree = "<group>"; };
+                                DA0000000000000000000452 /* UITouch-KIFAdditions.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = UITouch-KIFAdditions.h; sourceTree = "<group>"; };
+                                DA0000000000000000000453 /* UITouch-KIFAdditions.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = UITouch-KIFAdditions.m; sourceTree = "<group>"; };
+                                DA0000000000000000000454 /* IOHIDEvent+KIF.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOHIDEvent+KIF.h; sourceTree = "<group>"; };
+                                DA0000000000000000000455 /* IOHIDEvent+KIF.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IOHIDEvent+KIF.m; sourceTree = "<group>"; };
+                                DA0000000000000000000456 /* IOKit+SPI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOKit+SPI.h; sourceTree = "<group>"; };
+                                DA0000000000000000000457 /* UITouch+Private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = UITouch+Private.h; sourceTree = "<group>"; };
+                                DA0000000000000000000458 /* UIWindow+Private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = UIWindow+Private.h; sourceTree = "<group>"; };
+                                DA0000000000000000000459 /* UIEvent+Private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = UIEvent+Private.h; sourceTree = "<group>"; };
+                                DA000000000000000000045A /* UIApplication+Private.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = UIApplication+Private.h; sourceTree = "<group>"; };
+                                DA000000000000000000045B /* SBSAccessibilityWindowHostingController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SBSAccessibilityWindowHostingController.h; sourceTree = "<group>"; };
+                                DA000000000000000000045C /* SpringBoardServices.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SpringBoardServices.h; sourceTree = "<group>"; };
                                 DA0000000000000000000405 /* pid.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = pid.h; sourceTree = "<group>"; };
                                 DA0000000000000000000406 /* pid.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = pid.mm; sourceTree = "<group>"; };
                                 DA0000000000000000000407 /* GameLogic.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GameLogic.h; sourceTree = "<group>"; };
@@ -293,6 +309,8 @@
                                 DA0000000000000000000404 /* mahoa.h */,
                                 DA0000000000000000000441 /* Core */,
                                 DA0000000000000000000442 /* drawing_view */,
+                                DA000000000000000000045D /* sources */,
+                                DA000000000000000000045F /* headers */,
                         );
                         path = esp;
                         sourceTree = "<group>";
@@ -329,6 +347,41 @@
                         path = drawing_view;
                         sourceTree = "<group>";
                 };
+                DA000000000000000000045D /* sources */ = {
+                                        isa = PBXGroup;
+                                        children = (
+                                DA0000000000000000000450 /* TSEventFetcher.h */,
+                                DA0000000000000000000451 /* TSEventFetcher.mm */,
+                                DA000000000000000000045E /* KIF */,
+                                        );
+                                        path = sources;
+                                        sourceTree = "<group>";
+                                };
+                DA000000000000000000045E /* KIF */ = {
+                                        isa = PBXGroup;
+                                        children = (
+                                DA0000000000000000000452 /* UITouch-KIFAdditions.h */,
+                                DA0000000000000000000453 /* UITouch-KIFAdditions.m */,
+                                DA0000000000000000000454 /* IOHIDEvent+KIF.h */,
+                                DA0000000000000000000455 /* IOHIDEvent+KIF.m */,
+                                        );
+                                        path = KIF;
+                                        sourceTree = "<group>";
+                                };
+                DA000000000000000000045F /* headers */ = {
+                                        isa = PBXGroup;
+                                        children = (
+                                DA0000000000000000000456 /* IOKit+SPI.h */,
+                                DA0000000000000000000457 /* UITouch+Private.h */,
+                                DA0000000000000000000458 /* UIWindow+Private.h */,
+                                DA0000000000000000000459 /* UIEvent+Private.h */,
+                                DA000000000000000000045A /* UIApplication+Private.h */,
+                                DA000000000000000000045B /* SBSAccessibilityWindowHostingController.h */,
+                                DA000000000000000000045C /* SpringBoardServices.h */,
+                                        );
+                                        path = headers;
+                                        sourceTree = "<group>";
+                                };
                 DA0000000000000000000443 /* Resources */ = {
                         isa = PBXGroup;
                         children = (
@@ -437,6 +490,9 @@
                                 DA0000000000000000000420 /* espkrw.m in Sources */,
                                 DA0000000000000000000421 /* esphost.mm in Sources */,
                                 DA0000000000000000000422 /* pid.mm in Sources */,
+                                DA0000000000000000000460 /* TSEventFetcher.mm in Sources */,
+                                DA0000000000000000000461 /* UITouch-KIFAdditions.m in Sources */,
+                                DA0000000000000000000462 /* IOHIDEvent+KIF.m in Sources */,
                                 DA0000000000000000000423 /* GameLogic.mm in Sources */,
                                 DA0000000000000000000424 /* UnityMath.mm in Sources */,
                                 DA0000000000000000000425 /* esp.mm in Sources */,
@@ -589,6 +645,12 @@
                                         "$(SRCROOT)/DarkSword/esp",
                                         "$(SRCROOT)/DarkSword/esp/Core",
                                         "$(SRCROOT)/DarkSword/esp/drawing_view",
+                                        "$(SRCROOT)/DarkSword/esp/sources",
+                                        "$(SRCROOT)/DarkSword/esp/sources/KIF",
+                                        "$(SRCROOT)/DarkSword/esp/headers",
+                                        "$(SRCROOT)/DarkSword/esp/sources",
+                                        "$(SRCROOT)/DarkSword/esp/sources/KIF",
+                                        "$(SRCROOT)/DarkSword/esp/headers",
                                 );
                                 INFOPLIST_FILE = DarkSword/Info.plist;
                                 INFOPLIST_KEY_CFBundleDisplayName = DarkSword;
@@ -606,6 +668,8 @@
                                 OTHER_LDFLAGS = (
                                         "-framework",
                                         AVFoundation,
+                                        "-framework",
+                                        IOKit,
                                 );
                                 PRODUCT_BUNDLE_IDENTIFIER = "com.darksword.app";
                                 PRODUCT_NAME = DarkSword;
@@ -655,6 +719,8 @@
                                 OTHER_LDFLAGS = (
                                         "-framework",
                                         AVFoundation,
+                                        "-framework",
+                                        IOKit,
                                 );
                                 PRODUCT_BUNDLE_IDENTIFIER = "com.darksword.app";
                                 PRODUCT_NAME = DarkSword;

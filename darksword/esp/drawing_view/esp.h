@@ -75,7 +75,16 @@ extern float aimSpeed;
 extern bool isNoReload;
 extern bool isVohaDan;
 extern bool isFastFire;
-//phần cam cao
+
+// ─── Mod engine (CrackTeam parity) ────────────
+// Áp toàn bộ mod cho local player (gọi mỗi frame trong render loop).
+void ESPApplyMods(uint64_t myPawn);
+// Reset applied-state khi chết / rời match — want flags (config) giữ nguyên.
+void ESPResetModState(void);
+// Ghi chú panic-safety: mọi ghi mod đi qua mach_vm_write trên port game đã
+// transplant (isVaildPtr chặn địa chỉ rác, offset=0 → mod tự bỏ qua) —
+// không có kernel write nào, không rủi ro panic kernel.
+// phần cam cao
 extern bool camcao;
 extern float Campc;
 
