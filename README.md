@@ -90,3 +90,27 @@ xác nhận: ESPDrawingView, ESPManager, FloatingMenuView, GameLogic, ESPPrefs,
 MainTabController, StartESPViewController, ConfigViewController, LegacyTweaks,
 LogTextView…). XPF/libxpf.dylib build OK. Chỉ cần repo nhận đúng file trên là
 run kế tiếp qua hết compile.
+
+## 🔧 Runtime fix — phát hiện "Kernel chưa chạy" dù exploit đã win (2026-09-19)
+
+**Triệu chứng** (log thực tế trên máy): exploit chạy tới `early_kread64(...) ->
+0x…feedfacf / win??` (đọc được kernel → exploit THÀNH CÔNG), nhưng app vẫn báo
+`✗ Kernel exploit thất bại` → nút START ESP bị chặn "Kernel chưa chạy".
+
+**Nguyên nhân**: `dsb_isValidPtr()` trong `ESP/DSProcessBridge.m` dùng range
+USERLAND (`0x10000 … 0x800000000000`) để kiểm tra KERNEL pointer. Kernel pointer
+XNU arm64 có dạng `0xffffff…` — LỚN HƠN giới hạn trên → mọi kernel pointer hợp
+lệ đều bị coi là "invalid" → kiểm tra proc_self luôn fail.
+
+**Fix**: tách 2 range kiểm tra:
+- `dsb_isValidKernelPtr()` — cho proc/ucred/label/walk proc-list. Range lấy từ
+  `VM_MIN/MAX_KERNEL_ADDRESS` do `offsets_init()` của exploit set theo từng iOS
+  (fallback tĩnh `0xFFFFFFDC00000000 … 0xFFFFFFFBFFFFFFFF`).
+- `dsb_isValidUserPtr()` — cho địa chỉ bộ nhớ game (readMemory/writeMemory,
+  GameLogic vẫn giữ range userland của nó — đúng cho mục đích đó).
+
+Thêm nữa:
+- Fallback xác nhận kernel r/w qua `g_kernel_base` (magic `feedfacf`) nếu
+  proc_self hụt, kèm log giá trị proc_self để debug.
+- Bỏ 2 lệnh đọc "touch memory" thừa trong walk proc-list (tránh rủi ro panic
+  khi gặp entry lạ).
