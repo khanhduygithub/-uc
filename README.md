@@ -114,3 +114,23 @@ Thêm nữa:
   proc_self hụt, kèm log giá trị proc_self để debug.
 - Bỏ 2 lệnh đọc "touch memory" thừa trong walk proc-list (tránh rủi ro panic
   khi gặp entry lạ).
+
+## 🔧 Runtime fix 2 — crash ở bước rootify (ucred ghi nhầm = panic) (2026-09-19)
+
+**Triệu chứng**: exploit win → `✓ Kernel r/w OK! proc_self=… pid=…` → in
+`proc=… proc_ro=… ucred=…` → crash ngay sau đó (không in "✓ Rootified").
+
+**Nguyên nhân**: iOS 18.4+ đổi `offsetof(proc_ro, p_ucred)` từ 0x20 → 0x28.
+Nếu offsets_init không chọn đúng branch cho thiết bị, "ucred" đọc được thực ra
+là kernel object KHÁC (filedesc/pgrp…) — đọc thì không sao, nhưng rootify ghi
+32 byte vào object sai → **kernel panic**.
+
+**Fix** (ESP/DSProcessBridge.m — patchProcessPrivileges):
+- Probing CẢ HAI offset 0x20/0x28, verify cấu trúc ucred bằng cách CHỈ ĐỌC
+  (`dsb_ucredLooksValid`: uid/ruid/svuid/rgid nhỏ, ngroups ≤ 64, cr_label@0x78
+  là kernel ptr) — ghi chỉ diễn ra khi ucred ĐÃ verified.
+- Offset đúng được tự sửa (`off_proc_ro_p_ucred`) + log rõ.
+- Verify fail → hủy rootify, KHÔNG ghi kernel gì cả, log đầy đủ giá trị
+  (kèm bảo vệ: không kread vào địa chỉ không phải kernel ptr, vì early_kread
+  crash cố ý khi kaddr invalid).
+- proc_ro cũng được verify trước khi dùng.
