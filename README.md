@@ -9,7 +9,7 @@ Toàn bộ pipeline ESP của Vip.zip (FFExternal) đã được remake để ch
 
 | Vip.zip (TrollStore) | Excalibur (DarkSword) |
 |---|---|
-| `task_for_pid` nhờ entitlements | `task_for_pid` nhờ kernel patch (rootify + AMFI label = 0 + sandbox label = 0) |
+| `task_for_pid` nhờ entitlements | **FAKE TASK PORT** bằng kernel r/w — không task_for_pid, không root, không đụng ucred/AMFI |
 | Theos `.tipa` app | Xcode app (kfun) |
 | ModMenu (floating) | Tab UI: **Start ESP** + **Cấu hình** |
 
@@ -17,7 +17,7 @@ Toàn bộ pipeline ESP của Vip.zip (FFExternal) đã được remake để ch
 
 ```
 ESP/
-  DSProcessBridge.h/.m   ← lõi: kernel exploit → rootify/AMFI/sandbox → task port → r/w
+  DSProcessBridge.h/.m   ← lõi: kernel exploit → self-test → FAKE TASK PORT → r/w
   GameOffsets.h          ← offset game (cập nhật khi game update)
   GameLogic.h/.m         ← chuỗi Unity: match → players → bones → W2S
   ESPDrawingView.h/.m    ← CAShapeLayer overlay 60fps (box/bone/line/hp/name/dis)
@@ -34,7 +34,8 @@ Tweaks/
 
 ### Cách dùng
 
-1. Bấm **"1️⃣ Khởi động Kernel"** → DarkSword exploit + rootify + vá AMFI/sandbox
+1. Bấm **"1️⃣ Khởi động Kernel"** → DarkSword exploit + self-test kernel bridge
+   (chỉ đọc — KHÔNG còn rootify/ucred/AMFI — không thể panic như bản cũ)
 2. Mở game, quay lại app bấm **"▶️ START ESP"**
 3. ESP overlay phủ lên game — nút tròn góc trái: tap = cấu hình, kéo = di chuyển
 4. Tab **Cấu hình**: bật/tắt Box, Line, Name, Health, Distance, Bone, Count, Bot ESP…;
@@ -66,23 +67,25 @@ thay bằng bản fix khi push. Khi push zip này lên repo, phải đảm bảo
 đây bị **replace** (không bị bỏ sót):
 
 ```
-darksword-kexploit-fun/ESP/DSProcessBridge.m   ← 620 dòng (bản runtime fix 3, 2026-09-19 15:00)
+darksword-kexploit-fun/ESP/DSProcessBridge.m   ← 649 dòng (bản runtime fix 4 — FAKE TASK PORT, 2026-09-19 22:30)
 ```
 
 **Kiểm tra nhanh trên github.com** — mở `darksword-kexploit-fun/ESP/DSProcessBridge.m`:
 
-| Dòng | Bản ĐÚNG (zip này — fix 3) | Bản cũ hơn |
+| Dòng | Bản ĐÚNG (zip này — fix 4, fake task port) | Bản cũ hơn |
 |---|---|---|
-| 29 | `#import "GameOffsets.h"` | `#import "../kexploit/kexploit_opa334.h"` (bản build fail) |
-| 57 | `#pragma mark - ucred layout (TỰ DÒ — không tin cứng offset theo version)` | `#pragma mark - ucred layout (arm64, xnu-11215 / xnu-11417)` |
-| 141 | `static bool dsb_ucredResolve(uint64_t c,` | `static bool dsb_ucredLooksValid(uint64_t u)` |
-| 174 | `static int64_t dsb_probeLabelOffset(uint64_t ucred, int64_t preferred)` | (không có) |
-| 267 | `- (BOOL)patchProcessPrivileges {` (bắt đầu logic dò 4 slot) | dùng `candP/candA` 2 offset |
-| 320 | `uint32_t uidNow = (uint32_t)getuid();` (xác minh rootify LIVE) | (không có — tin mù sau ghi) |
-| 347 | `int64_t lblOff = dsb_probeLabelOffset(liveUcred, …)` | `uint64_t label = kread_ptr(ucred + off_ucred_cr_label);` |
+| 52 | `#import "GameOffsets.h"   // kLegacyGameProcessName (thiếu import này → "unexpected '@'")` | (khác) |
+| 150 | `static uint64_t dsb_kernelFindProc(pid_t pid, const char *name) {` | (không có — bản cũ dò ucred) |
+| 265 | `#pragma mark - Bước 2: Self-test kernel bridge (CHỈ ĐỌC — thay cho rootify cũ)` | `#pragma mark - Bước 2: Rootify + vá AMFI/sandbox (thay TrollStore)` |
+| 278 | `- (BOOL)patchProcessPrivileges {` (self-test chỉ đọc) | dùng `dsb_ucredResolve`/rootify |
+| 370 | `#pragma mark - Bước 4: FAKE TASK PORT — cơ chế DarkSword (thay task_for_pid)` | (không có) |
+| 430 | `uint64_t realObj = task_get_ipc_port_object(task_self(), mach_task_self());` | (không có) |
+| 446 | `kwrite64(fakeObj + off_ipc_port_ip_kobject, gameTask);   // kobject := game` | `kwrite32(cand + f->uid, 0);` (rootify cũ) |
+| 631 | `mach_port_destroy(mach_task_self(), g_dsbGameTask);` | `mach_port_deallocate(…)` |
 
-Tổng cộng file: **620 dòng**. Nếu file trong repo ngắn hơn (~477 hoặc ~575 dòng)
-thì push chưa thay được file mới.
+Tổng cộng file: **649 dòng**. Nếu file trong repo ngắn hơn (477/575/620 dòng)
+hoặc vẫn còn chữ `rootify cand`/`dsb_ucredResolve` thì push chưa thay được file mới.
+Ngoài ra `kexploit/kutils.h` phải có dòng 24: `uint64_t task_get_ipc_port_object(uint64_t task, mach_port_t port);`
 
 Tổng hợp fix trong file này (run 15→17):
 1. Xoá `#import <libproc.h>` — header chỉ có ở macOS SDK (run 15)
@@ -190,3 +193,72 @@ Kết quả mong đợi trên log:
 ```
 Nếu vẫn fail: log giờ có hexdump `proc_ro` / `ucred` đầy đủ — gửi lại log là
 xác định được layout chính xác ngay.
+
+## 🔧 Runtime fix 4 — BỎ rootify, chuyển sang FAKE TASK PORT bằng kernel r/w (2026-09-19 22:30)
+
+**Triệu chứng** (screenshot IMG_4623.png, log thật từ thiết bị):
+```
+[DSB] ✓ Kernel r/w OK! proc_self=0xffffffdd38565240 pid=1225
+[DSB] selfProc=0xffffffdd38565240 proc_ro=0xffffffdce6d2a130 getuid=501
+[DSB] probe proc_ro+0x28 → 0xffffffdd339b5810
+<— CRASH ở đây, không in thêm gì nữa>
+```
+
+**Nguyên nhân**: bản fix 3 dò p_ucred bằng cách kread các candidate pointer
+(`proc_ro+0x28/0x20/0x18`). Trên build kernel của máy này, `proc_ro+0x28`
+KHÔNG phải p_ucred → candidate `0xffffffdd339b5810` là object khác →
+`early_kread` (getsockopt ICMP6_FILTER) bcopy từ địa chỉ KHÔNG mapped →
+**KERNEL PANIC**. Dò candidate kiểu này không thể an toàn 100% trên mọi build
+kernel (khi nào lệch offset là panic) — phải bỏ hẳn.
+
+**Cơ chế MỚI (FAKE TASK PORT — "đổi cơ chế sang DarkSword")**: không cần
+rootify, không cần task_for_pid, không cần vá AMFI/sandbox. Kernel r/w tự tạo
+task port của game:
+
+1. `dsb_kernelFindProc(pid)` — walk proc-list trong kernel (2 chiều từ proc
+   của mình, có range-guard + sanity pid → KHÔNG BAO GIỜ kread vào con trỏ
+   rác → không panic được) → tìm proc của game
+2. `proc → proc_ro → pr_task` = task của game (offset có sẵn trong offsets.m
+   theo version — đọc field thật, không đoán)
+3. `mach_port_allocate(RECEIVE)` + `insert_right(MAKE_SEND)` — tạo mach port
+   trong process của mình
+4. `task_get_ipc_port_object(task_self(), port)` — định vị ipc_port object
+   của port vừa tạo trong is_table (hàm có sẵn của exploit, tự xử lý format
+   kalloc array iOS 16.1+)
+5. `kwrite32 io_bits := io_bits của task port THẬT của mình` — kotype := 
+   IKOT_TASK được COPY (không đoán giá trị theo version)
+6. `kwrite64 ip_kobject := task của game`
+
+→ Port đó chính là task port của game: `mach_vm_read_overwrite` /
+`mach_vm_write` / `task_info(TASK_DYLD_INFO)` / `vm_read` hoạt động trực tiếp
+lên bộ nhớ game (kernel không kiểm tra entitlement ở đường port-based — port
+CHÍNH LÀ capability). Toàn bộ bước ghi chỉ đụng 2 field của mach port MÌNH
+VỪA TẠO (địa chỉ chắc chắn sống) → không thể panic vì ghi nhầm object khác.
+
+`patchProcessPrivileges` giờ là **SELF-TEST chỉ đọc**: xác minh chuỗi
+`task_self → itk_space → is_table → ipc_port(mach_task_self())` và kiểm tra
+`io_bits` của task port thật (ACTIVE + kotype ≠ 0) TRƯỚC khi ghi bất cứ thứ
+gì — nếu offset lệch thì dừng sạch, không ghi gì (không crash).
+
+**Kết quả mong đợi trên log:**
+```
+[DSB] ✓ Kernel r/w OK! proc_self=0x… pid=…
+[DSB] ✓ Kernel bridge OK (self-test chỉ đọc):
+[DSB]    selfTask=0x… itk_space=0x… taskport_obj=0x…
+[DSB]    io_bits=0x… kotype=… — sẽ copy nguyên xi sang fake port
+[DSB] ✓ Game PID = …
+[DSB] gameProc=0x… (pid=…)
+[DSB] gameTask=0x… (proc_ro+pr_task)
+[DSB] ✓ Fake task port: name=0x… obj=0x… io_bits 0x…→0x…, ip_kobject(+0x…) = gameTask 0x…
+[DSB] ✓ Module 'UnityFramework' base = 0x…
+[DSB] ✅ CONNECTED: pid=… fakeTaskPort=0x… base=…
+```
+
+File thay đổi so với fix 3:
+- `ESP/DSProcessBridge.m` — viết lại hoàn toàn (649 dòng): xoá toàn bộ
+  ucred layout/probe/rootify/AMFI, thêm `dsb_kernelFindProc`, self-test,
+  fake task port, disconnect khôi phục io_bits trước `mach_port_destroy`.
+- `kexploit/kutils.h` — thêm khai báo `task_get_ipc_port_table_entry` /
+  `task_get_ipc_port_object` (định nghĩa có sẵn trong kutils.m nhưng thiếu
+  prototype → Xcode báo "call to undeclared function").
+- `MainUI/StartESPViewController.m` — status "✅ Root+AMFI" → "✅ Bridge OK".
