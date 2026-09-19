@@ -66,16 +66,23 @@ thay bằng bản fix khi push. Khi push zip này lên repo, phải đảm bảo
 đây bị **replace** (không bị bỏ sót):
 
 ```
-darksword-kexploit-fun/ESP/DSProcessBridge.m   ← 477 dòng (bản cũ ngắn hơn ~13 dòng)
+darksword-kexploit-fun/ESP/DSProcessBridge.m   ← 620 dòng (bản runtime fix 3, 2026-09-19 15:00)
 ```
 
 **Kiểm tra nhanh trên github.com** — mở `darksword-kexploit-fun/ESP/DSProcessBridge.m`:
 
-| Dòng | Bản ĐÚNG (zip này) | Bản CŨ (build fail) |
+| Dòng | Bản ĐÚNG (zip này — fix 3) | Bản cũ hơn |
 |---|---|---|
-| 29 | `#import "GameOffsets.h"` | `#import "../kexploit/kexploit_opa334.h"` |
-| ~43–53 | `extern kern_return_t mach_vm_read_overwrite(...)` | `#import <mach/mach_vm.h>` |
-| 413 | `pid = [self findGamePID:@kLegacyGameProcessName];` (có macro → OK) | cùng dòng nhưng thiếu macro → `unexpected '@'` |
+| 29 | `#import "GameOffsets.h"` | `#import "../kexploit/kexploit_opa334.h"` (bản build fail) |
+| 57 | `#pragma mark - ucred layout (TỰ DÒ — không tin cứng offset theo version)` | `#pragma mark - ucred layout (arm64, xnu-11215 / xnu-11417)` |
+| 141 | `static bool dsb_ucredResolve(uint64_t c,` | `static bool dsb_ucredLooksValid(uint64_t u)` |
+| 174 | `static int64_t dsb_probeLabelOffset(uint64_t ucred, int64_t preferred)` | (không có) |
+| 267 | `- (BOOL)patchProcessPrivileges {` (bắt đầu logic dò 4 slot) | dùng `candP/candA` 2 offset |
+| 320 | `uint32_t uidNow = (uint32_t)getuid();` (xác minh rootify LIVE) | (không có — tin mù sau ghi) |
+| 347 | `int64_t lblOff = dsb_probeLabelOffset(liveUcred, …)` | `uint64_t label = kread_ptr(ucred + off_ucred_cr_label);` |
+
+Tổng cộng file: **620 dòng**. Nếu file trong repo ngắn hơn (~477 hoặc ~575 dòng)
+thì push chưa thay được file mới.
 
 Tổng hợp fix trong file này (run 15→17):
 1. Xoá `#import <libproc.h>` — header chỉ có ở macOS SDK (run 15)
@@ -134,3 +141,52 @@ là kernel object KHÁC (filedesc/pgrp…) — đọc thì không sao, nhưng ro
   (kèm bảo vệ: không kread vào địa chỉ không phải kernel ptr, vì early_kread
   crash cố ý khi kaddr invalid).
 - proc_ro cũng được verify trước khi dùng.
+
+## 🔧 Runtime fix 3 — rootify bị hủy: "Không verify được ucred" → ESP fail (2026-09-19)
+
+**Triệu chứng** (log thật từ thiết bị):
+```
+[DSB] ✓ Kernel r/w OK! proc_self=0xffffffdd38816db0 pid=526
+[DSB] proc_ro=0xffffffdce6e1d030 → ucred@0x28=0xffffffdd339b9db0, ucred@0x20=0x2200230100000001
+[DSB] ✗ Không verify được ucred (cả 2 offset đều không giống ucred) — HỦY rootify, không ghi kernel
+[DSB]   candP@0x28=0xffffffdd339b9db0: uid=0x1f5 ngroups=0x4 lbl=0x92aaa6dce6d17de0
+```
+Kernel đã thành công, nhưng rootify bị hủy 5 lần liên tiếp → không có root →
+`task_for_pid` không thể thông qua → **ESP fail**.
+
+**Chẩn đoán**: chữ ký ucred cũ yêu cầu `cr_label@0x78` phải là kernel pointer
+(offset patchfinder `off_ucred_cr_label=0x78`, ghi cho 17.0–26). Trên máy này
+uid@0x18=501 (ĐÚNG uid mobile) và ngroups=4 (hợp lệ) — tức candidate IS ucred —
+nhưng `lbl@0x78 = 0x92aaa6dce6d17de0` (rác) → layout ucred của build kernel này
+khác giả định → verify fail → rootify bị hủy vĩnh viễn (deterministic).
+
+**Fix** (ESP/DSProcessBridge.m — viết lại `patchProcessPrivileges`):
+- **Tự dò layout ucred** (FLAT `uid@0x18` / UNION `uid@0x48`): candidate chỉ được
+  chấp nhận khi **uid == ruid == svuid == getuid()** (3 u32 liên tiếp trùng đúng
+  uid của mình — không thể trùng ngẫu nhiên → không bao giờ ghi nhầm object khác).
+- **Dò p_ucred ở 4 slot** của proc_ro: offset offsets_init + 0x28/0x20/0x18.
+- **Rootify thử từng candidate + xác minh SỐNG bằng `getuid()==0`**: nếu ucred
+  stale (đã free) thì ghi 0 vô hại, tự động thử slot kế tiếp. Chỉ khi getuid()
+  thực sự = 0 mới coi là root thành công (không còn "ghi xong rồi tin").
+- **Dò cr_label bằng chữ ký struct label** thay vì tin offset 0x78: slot phải có
+  giá trị là kernel ptr ≠ ucred, `l_flags` (u32 đầu) nhỏ, và CẢ `label+0x8`
+  (AMFI perpolicy) lẫn `label+0x10` (sandbox perpolicy) đều là kernel pointer —
+  chữ ký rất chặt. Offset tìm được tự sửa vào `off_ucred_cr_label`.
+- Không tìm được label → KHÔNG blind-write (tránh panic), hexdump ucred 0xC0
+  vào log để chẩn đoán, vẫn tiếp tục với root đã ăn.
+- Fallback `patch_sandbox_ext()` đã bỏ khỏi path này (nó dùng `off_ucred_cr_label`
+  chưa verify → deref địa chỉ rác = nguy cơ panic).
+
+Kết quả mong đợi trên log:
+```
+[DSB] selfProc=0x… proc_ro=0x… getuid=501
+[DSB] probe proc_ro+0x28 → 0x…
+[DSB] rootify cand=0x… (layout flat(uid@0x18)) → getuid()=0 ✓ LIVE
+[DSB] ✓ Rootified! ucred=0x… , getuid()=0
+[DSB]   cr_label probe: ucred+0x78 → label=0x… ✓        ← hoặc slot khác
+[DSB] ✓ AMFI label = 0, sandbox label = 0
+[DSB] ✓ task_for_pid(…) OK — task port 0x…
+[DSB] ✅ CONNECTED: pid=… task=… base=…
+```
+Nếu vẫn fail: log giờ có hexdump `proc_ro` / `ucred` đầy đủ — gửi lại log là
+xác định được layout chính xác ngay.
