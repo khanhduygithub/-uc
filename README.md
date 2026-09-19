@@ -57,3 +57,36 @@ Tweaks/
 # Credit
 - wh1te4ever for kfun-darksword project
 - Vip.zip (FFExternal) for the ESP pipeline idea — rebuilt on DarkSword
+
+## 🔎 CI build fix — trạng thái run 15→17 (2026-09-19)
+
+⚠️ **Run 16 & 17 fail vì repo GitHub vẫn giữ file CŨ**: 2 run báo lỗi Y HỆT nhau
+(cùng số dòng 353/365/413) trong `ESP/DSProcessBridge.m` → file này CHƯA được
+thay bằng bản fix khi push. Khi push zip này lên repo, phải đảm bảo file dưới
+đây bị **replace** (không bị bỏ sót):
+
+```
+darksword-kexploit-fun/ESP/DSProcessBridge.m   ← 477 dòng (bản cũ ngắn hơn ~13 dòng)
+```
+
+**Kiểm tra nhanh trên github.com** — mở `darksword-kexploit-fun/ESP/DSProcessBridge.m`:
+
+| Dòng | Bản ĐÚNG (zip này) | Bản CŨ (build fail) |
+|---|---|---|
+| 29 | `#import "GameOffsets.h"` | `#import "../kexploit/kexploit_opa334.h"` |
+| ~43–53 | `extern kern_return_t mach_vm_read_overwrite(...)` | `#import <mach/mach_vm.h>` |
+| 413 | `pid = [self findGamePID:@kLegacyGameProcessName];` (có macro → OK) | cùng dòng nhưng thiếu macro → `unexpected '@'` |
+
+Tổng hợp fix trong file này (run 15→17):
+1. Xoá `#import <libproc.h>` — header chỉ có ở macOS SDK (run 15)
+2. Xoá `#import <mach/mach_vm.h>` — header `#error` trên iOS SDK → thay bằng
+   `extern` prototype `mach_vm_read_overwrite` / `mach_vm_write` (run 16)
+3. Thêm `#import "GameOffsets.h"` — thiếu macro `kLegacyGameProcessName`
+   gây lỗi `unexpected '@' in program` (run 16)
+4. `printf("%@")` → `printf("%s", x.UTF8String)` — macro printf không hỗ trợ `%@` (run 16)
+
+Ngoài `DSProcessBridge.m`, MỌI file khác đã compile OK trên CI (run 16 & 17
+xác nhận: ESPDrawingView, ESPManager, FloatingMenuView, GameLogic, ESPPrefs,
+MainTabController, StartESPViewController, ConfigViewController, LegacyTweaks,
+LogTextView…). XPF/libxpf.dylib build OK. Chỉ cần repo nhận đúng file trên là
+run kế tiếp qua hết compile.
